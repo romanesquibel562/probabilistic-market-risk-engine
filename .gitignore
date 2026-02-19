@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environments / secrets
+.venv/
+venv/
+ENV/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project outputs
+artifacts/
+logs/
+
+# Notebooks / local
+notebooks/
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
