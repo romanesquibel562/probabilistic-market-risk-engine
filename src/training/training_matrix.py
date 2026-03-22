@@ -456,4 +456,3 @@ def split_train_test(df: pd.DataFrame, split: SplitConfig) -> tuple[pd.DataFrame
         test = test[test["as_of_date"] <= split.test_end].copy()
 
     return train.reset_index(drop=True), test.reset_index(drop=True)
-
