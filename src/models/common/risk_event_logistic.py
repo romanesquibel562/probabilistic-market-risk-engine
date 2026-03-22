@@ -11,16 +11,11 @@ import numpy as np
 import pandas as pd
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    average_precision_score,
-    brier_score_loss,
-    log_loss,
-    roc_auc_score,
-)
+from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 from sklearn.isotonic import IsotonicRegression
 
 from src.core.config import settings
-from src.training.training_matrix import build_training_matrix
+from src.training.training_matrix import build_training_matrix_asof
 
 
 # ----------------------------
@@ -34,45 +29,61 @@ RankMethod = Literal["score", "prob"]
 
 @dataclass
 class EventLogitConfig:
-    # Market is required (no SPY default)
     market: str
+
+    # leakage-safe read lock
+    as_of_ts: datetime | None = None
 
     # target
     horizon_days: int = 5
     target_name: str = "fwd_ret_5d_log"
-    target_version: str | None = None  # defaulted from settings if None
+    target_version: str | None = None
 
     # features
-    feature_version: str | None = None  # defaulted from settings if None
+    feature_version: str | None = None
 
-    # windows (row-count windows; you treat them as trading-days-ish)
+    # windows are “rows” in your output (not literal days)
     test_window_days: int = 90
     calib_window_days: int = 90
 
     # event definition
     event_rule: EventRule = "sigma"
     sigma_mult: float = 1.25
-    event_quantile: float = 0.20
+    event_quantile: float = 0.10
 
-    # orchestrator convenience
+    # convenience
     auto_tune_defaults: bool = True
 
-    # calibration & production safeguards
+    # calibration
     calib_split: CalibSplit = "interleaved"
     allow_isotonic: bool = True
+
+    # base-rate alignment
     apply_prior_correction: bool = True
-    prior_anchor: Literal["fit", "calib"] = "calib"  # which set to anchor base rate correction to (if enabled)
+    prior_anchor: Literal["fit", "calib"] = "calib"
 
-    # ranking selection (for Top-K alerts)
+    # ranking selection (kept, but we force Option A below)
     choose_rank_method: bool = True
-    rank_metric_k: float = 0.10  # pick ranking method by F1 at this top-k on CALIB
+    rank_metric_k: float = 0.10
 
-    fit_max_rows: int | None = None     # optional cap on FIT history to reduce regime mismatch (for long horizons)
-    fit_tail_only: bool = True          # whether to fit event definition on FIT tail only (vs whole FIT)
-    debug_splits: bool = False          # whether to print event rates on FIT tail vs head for debugging
+    # fit capping
+    fit_max_rows: int | None = None
+    fit_tail_only: bool = True
+    debug_splits: bool = False
 
-    # artifact/logging
+    # artifacts
     out_dir: str = "artifacts/models"
+
+    # calibration guards
+    spread_min: float = 0.05
+    p_std_min: float | None = None
+    unique_ratio_min: float = 0.05
+    min_levels: int = 12
+    max_auc_drop: float = 0.02
+    max_ap_drop: float = 0.02
+
+    # model
+    class_weight: str | None = None
 
 
 # ----------------------------
@@ -102,45 +113,70 @@ def _has_both_classes(y: np.ndarray) -> bool:
     return len(np.unique(y)) == 2
 
 
-def prior_correct_probs(
-    p: np.ndarray,
-    *,
-    train_base_rate: float,
-    desired_base_rate: float,
-) -> np.ndarray:
-    """
-    Intercept-only correction in log-odds space.
-    Production safeguard to prevent p_mean drifting away from anchored base rate.
-    """
-    eps = 1e-9
-    train_base_rate = float(np.clip(train_base_rate, eps, 1 - eps))
-    desired_base_rate = float(np.clip(desired_base_rate, eps, 1 - eps))
-
-    shift = (
-        np.log(desired_base_rate / (1 - desired_base_rate))
-        - np.log(train_base_rate / (1 - train_base_rate))
-    )
-    return _sigmoid(_logit(p) + shift)
+def _p_std_min_for_horizon(h: int) -> float:
+    # horizon-aware minimum spread/variance guard
+    if h >= 63:
+        return 0.01
+    if h >= 21:
+        return 0.02
+    return 0.035
 
 
 def _auto_tune_defaults(cfg: EventLogitConfig) -> EventLogitConfig:
     """
-    Horizon-specific defaults.
+    Horizon + rule-specific defaults.
+    Key principles:
+      - 5d: NEVER use class_weight="balanced" (it inflates base-rate; you already fixed this)
+      - quantile events: avoid class_weight="balanced" (it can badly distort probabilities)
+      - isotonic: only allow for 5d
+      - p_std_min: looser for rarer events/horizons
     """
     if not cfg.auto_tune_defaults:
         return cfg
 
-    cfg = EventLogitConfig(**cfg.__dict__)  # copy
+    cfg = EventLogitConfig(**cfg.__dict__)  # shallow copy
+
+    # ---- universal: quantile events should not use balanced weights
+    if cfg.event_rule == "quantile":
+        cfg.class_weight = None
 
     if cfg.horizon_days == 5:
+        cfg.class_weight = None  # critical for 5d (sigma + quantile)
+
         cfg.allow_isotonic = True
         cfg.test_window_days = 90
         cfg.calib_window_days = 252
+
+        if cfg.event_rule == "sigma":
+            cfg.p_std_min = 0.035
+            cfg.spread_min = 0.06
+            cfg.unique_ratio_min = 0.15
+            cfg.min_levels = 12
+            cfg.max_auc_drop = 0.02
+            cfg.max_ap_drop = 0.02
+        else:
+            cfg.p_std_min = 0.02
+            cfg.spread_min = 0.04
+            cfg.unique_ratio_min = 0.10
+            cfg.min_levels = 12
+            cfg.max_auc_drop = 0.02
+            cfg.max_ap_drop = 0.02
 
     elif cfg.horizon_days == 21:
         cfg.allow_isotonic = False
         cfg.test_window_days = 252
         cfg.calib_window_days = 252
+
+        cfg.spread_min = 0.05
+        cfg.unique_ratio_min = 0.12
+        cfg.max_auc_drop = 0.02
+        cfg.max_ap_drop = 0.02
+        cfg.p_std_min = 0.02
+        cfg.min_levels = 10
+
+        # balanced is OK for sigma; quantile already forced to None above
+        if cfg.event_rule == "sigma":
+            cfg.class_weight = "balanced"
 
     elif cfg.horizon_days == 63:
         cfg.allow_isotonic = False
@@ -148,32 +184,27 @@ def _auto_tune_defaults(cfg: EventLogitConfig) -> EventLogitConfig:
         cfg.test_window_days = 504
         cfg.calib_window_days = 504
 
+        cfg.p_std_min = 0.01
+        cfg.min_levels = 12
+        cfg.spread_min = 0.04
+        cfg.unique_ratio_min = 0.08
+        cfg.max_auc_drop = 0.03
+        cfg.max_ap_drop = 0.03
+
+        # balanced is OK for sigma; quantile already forced to None above
+        if cfg.event_rule == "sigma":
+            cfg.class_weight = "balanced"
+
     return cfg
-
-
-def _p_std_min_for_horizon(h: int) -> float:
-    # Longer horizons naturally have smoother probability streams.
-    if h >= 63:
-        return 0.01
-    if h >= 21:
-        return 0.02
-    return 0.04
 
 
 def _platt_fit(s: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     s = np.asarray(s, dtype=float).reshape(-1, 1)
     y = np.asarray(y, dtype=int)
-
     lr = LogisticRegression(solver="lbfgs", max_iter=2000)
     lr.fit(s, y)
     a = float(lr.coef_.ravel()[0])
     b = float(lr.intercept_.ravel()[0])
-
-    # prevent ranking inversion
-    if a < 0:
-        a = -a
-        b = -b  # sigmoid(a*s+b) == 1 - sigmoid(original)
-
     return a, b
 
 
@@ -183,10 +214,7 @@ def _platt_predict(s: np.ndarray, a: float, b: float) -> np.ndarray:
 
 
 def _pick_vol_col(df: pd.DataFrame, h: int) -> str:
-    """
-    Pick realized vol column matching horizon if available.
-    """
-    candidates = [f"rv_{h}d", "rv_21d", "rv_5d"]
+    candidates = [f"rv_{h}d", f"rv_{h}", "rv_63d", "rv_63", "rv_21d", "rv_21", "rv_5d", "rv_5"]
     for c in candidates:
         if c in df.columns:
             return c
@@ -194,10 +222,6 @@ def _pick_vol_col(df: pd.DataFrame, h: int) -> str:
 
 
 def _solve_intercept_shift(p: np.ndarray, target_rate: float) -> float:
-    """
-    Find shift s such that mean(sigmoid(logit(p) + s)) ~= target_rate.
-    Binary search in logit space; stable and monotonic.
-    """
     eps = 1e-9
     target_rate = float(np.clip(target_rate, eps, 1 - eps))
     p = np.clip(np.asarray(p, dtype=float), eps, 1 - eps)
@@ -221,8 +245,7 @@ def _apply_intercept_shift(p: np.ndarray, shift: float) -> np.ndarray:
 
 def _reliability_table(y: np.ndarray, p: np.ndarray, n_bins: int = 10) -> pd.DataFrame:
     y = np.asarray(y, dtype=int)
-    p = np.asarray(p, dtype=float)
-    p = np.clip(p, 1e-9, 1 - 1e-9)
+    p = np.clip(np.asarray(p, dtype=float), 1e-9, 1 - 1e-9)
 
     edges = np.linspace(0.0, 1.0, n_bins + 1)
     bin_id = np.digitize(p, edges, right=True) - 1
@@ -248,7 +271,6 @@ def _reliability_table(y: np.ndarray, p: np.ndarray, n_bins: int = 10) -> pd.Dat
                 "gap_y_minus_p": float(y_rate - p_mean),
             }
         )
-
     return pd.DataFrame(rows)
 
 
@@ -321,14 +343,14 @@ def _rolling_calibration(
 
 
 # ----------------------------
-# Event definition (consistent)
+# Event definition
 # ----------------------------
 
 @dataclass
 class EventDef:
     rule: EventRule
-    quantile_cut: float | None = None   # for quantile rule
-    vol_col: str | None = None          # for sigma rule
+    quantile_cut: float | None = None
+    vol_col: str | None = None
 
 
 def _validate_target_pair(target_name: str, horizon_days: int) -> None:
@@ -455,10 +477,7 @@ def _metrics(tag: str, y: np.ndarray, p: np.ndarray) -> dict:
     y = np.asarray(y, dtype=int)
     p = np.asarray(p, dtype=float)
     p_clip = np.clip(p, 1e-9, 1 - 1e-9)
-
-    uniq = np.unique(y)
-    has_two = len(uniq) > 1
-
+    has_two = len(np.unique(y)) > 1
     return {
         "tag": tag,
         "event_rate": float(y.mean()) if len(y) else float("nan"),
@@ -514,49 +533,48 @@ def _topk_alerts(tag_prefix: str, y: np.ndarray, score: np.ndarray, ks=(0.05, 0.
     return out
 
 
-def _topk_f1_at_k(y: np.ndarray, score: np.ndarray, k: float) -> tuple[float, float, float]:
-    rows = _topk_alerts("tmp", y, score, ks=(k,))
-    if not rows:
-        return 0.0, 0.0, 0.0
-    r = rows[0]
-    return float(r["precision"]), float(r["recall"]), float(r["f1"])
-
-
 def _select_best_calibration(
     *,
-    y_calib: np.ndarray,
-    p_calib_raw: np.ndarray,
-    p_calib_sig: np.ndarray | None,
-    p_calib_iso: np.ndarray | None,
+    y_ref: np.ndarray,
+    p_raw: np.ndarray,
+    p_sig: np.ndarray | None,
+    p_iso: np.ndarray | None,
     min_improve: float = 1e-6,
     spread_min: float = 0.05,
     p_std_min: float = 0.02,
     unique_ratio_min: float = 0.05,
+    min_levels: int = 12,
     max_auc_drop: float = 0.02,
     max_ap_drop: float = 0.02,
+    label: str = "calib",
 ) -> tuple[str, dict]:
-    y_calib = np.asarray(y_calib, dtype=int)
+    """
+    Generic calibration selector that can run on CALIB or FIT when CALIB is inverted.
+    """
+    y_ref = np.asarray(y_ref, dtype=int)
 
     def clip(p: np.ndarray) -> np.ndarray:
         return np.clip(np.asarray(p, dtype=float), 1e-9, 1 - 1e-9)
 
-    def score_calib(p: np.ndarray) -> dict:
+    def score_ref(p: np.ndarray) -> dict:
         p = clip(p)
-        b = float(brier_score_loss(y_calib, p))
-        ll = float(log_loss(y_calib, p, labels=[0, 1]))
+        b = float(brier_score_loss(y_ref, p))
+        ll = float(log_loss(y_ref, p, labels=[0, 1]))
 
         q05, q95 = np.quantile(p, [0.05, 0.95])
         spread = float(q95 - q05)
 
-        if _has_both_classes(y_calib):
-            auc = float(roc_auc_score(y_calib, p))
-            ap = float(average_precision_score(y_calib, p))
+        if _has_both_classes(y_ref):
+            auc = float(roc_auc_score(y_ref, p))
+            ap = float(average_precision_score(y_ref, p))
         else:
             auc = float("nan")
             ap = float("nan")
 
         p_std = float(np.std(p))
-        unique_ratio = float(len(np.unique(np.round(p, 6))) / max(1, len(p)))
+        uniq = np.unique(np.round(p, 6))
+        unique_ratio = float(len(uniq) / max(1, len(p)))
+        n_levels = int(len(uniq))
 
         return {
             "brier": b,
@@ -564,21 +582,21 @@ def _select_best_calibration(
             "spread_p95_p05": spread,
             "p_std": p_std,
             "unique_ratio": unique_ratio,
+            "n_levels": n_levels,
             "auc": auc,
             "ap": ap,
         }
 
-    scores: dict[str, dict[str, float]] = {}
-
-    scores["raw"] = score_calib(p_calib_raw)
+    scores: dict[str, dict[str, float] | dict] = {}
+    scores["raw"] = score_ref(p_raw)
     raw = scores["raw"]
 
     candidates: list[str] = ["raw"]
-    if p_calib_sig is not None:
-        scores["sigmoid"] = score_calib(p_calib_sig)
+    if p_sig is not None:
+        scores["sigmoid"] = score_ref(p_sig)
         candidates.append("sigmoid")
-    if p_calib_iso is not None:
-        scores["isotonic"] = score_calib(p_calib_iso)
+    if p_iso is not None:
+        scores["isotonic"] = score_ref(p_iso)
         candidates.append("isotonic")
 
     rejected: dict[str, str] = {}
@@ -587,7 +605,12 @@ def _select_best_calibration(
     for name in candidates:
         if name == "raw":
             continue
-        s = scores[name]
+        s = scores[name]  # type: ignore[assignment]
+
+        # Reject inverted candidates on this reference split (only meaningful if both classes exist)
+        if _has_both_classes(y_ref) and np.isfinite(s.get("auc", float("nan"))) and s["auc"] < 0.5:
+            rejected[name] = "auc<0.500 (inverted)"
+            continue
 
         if s["spread_p95_p05"] < spread_min:
             rejected[name] = f"spread<{spread_min:.3f}"
@@ -595,9 +618,15 @@ def _select_best_calibration(
         if s.get("p_std", 1.0) < p_std_min:
             rejected[name] = f"p_std<{p_std_min:.3f}"
             continue
-        if s.get("unique_ratio", 1.0) < unique_ratio_min:
-            rejected[name] = f"unique_ratio<{unique_ratio_min:.3f}"
-            continue
+
+        if name == "isotonic":
+            if s["n_levels"] < min_levels:
+                rejected[name] = f"n_levels<{min_levels}"
+                continue
+        else:
+            if s.get("unique_ratio", 1.0) < unique_ratio_min:
+                rejected[name] = f"unique_ratio<{unique_ratio_min:.3f}"
+                continue
 
         if np.isfinite(raw["auc"]) and np.isfinite(s["auc"]):
             if (raw["auc"] - s["auc"]) > max_auc_drop:
@@ -610,15 +639,16 @@ def _select_best_calibration(
 
         viable.append(name)
 
-    best_name = sorted(viable, key=lambda n: (scores[n]["brier"], scores[n]["log_loss"]))[0]
+    best_name = sorted(viable, key=lambda n: (scores[n]["brier"], scores[n]["log_loss"]))[0]  # type: ignore[index]
 
     if best_name != "raw":
-        if (raw["brier"] - scores[best_name]["brier"]) < float(min_improve):
+        if (raw["brier"] - scores[best_name]["brier"]) < float(min_improve):  # type: ignore[index]
             best_name = "raw"
 
     scores["rejected"] = rejected
     scores["chosen"] = {"name": best_name}
-    return best_name, scores
+    scores["selection_label"] = {"label": label}
+    return best_name, scores  # type: ignore[return-value]
 
 
 def _build_prod_probs_from_choice(
@@ -635,6 +665,30 @@ def _build_prod_probs_from_choice(
     return p_raw
 
 
+def _select_feature_columns(df: pd.DataFrame) -> list[str]:
+    exclude = {
+        "market",
+        "as_of_date",
+        "forward_date",
+        "target_value",
+        "target_name",
+        "horizon_days",
+        "target_version",
+        "feature_version",
+        "available_time",
+        "computed_at",
+        "run_id",
+        "source",
+        "series_id",
+        "value",
+        "ingested_at",
+    }
+    cols = [c for c in df.columns if c not in exclude]
+    if not cols:
+        raise ValueError("No feature columns left after exclude list.")
+    return cols
+
+
 # ----------------------------
 # Main runner
 # ----------------------------
@@ -642,7 +696,6 @@ def _build_prod_probs_from_choice(
 def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
     cfg = _auto_tune_defaults(cfg)
 
-    # Fill versions from settings if not explicitly provided
     if cfg.feature_version is None:
         cfg.feature_version = settings.DEFAULT_FEATURE_VERSION
     if cfg.target_version is None:
@@ -650,20 +703,30 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
 
     _validate_target_pair(cfg.target_name, cfg.horizon_days)
 
-    prior_correction_meta = {"enabled": False}
+    if cfg.as_of_ts is None:
+        cfg.as_of_ts = _utc_now()
+    else:
+        if cfg.as_of_ts.tzinfo is None:
+            cfg.as_of_ts = cfg.as_of_ts.replace(tzinfo=timezone.utc)
+        else:
+            cfg.as_of_ts = cfg.as_of_ts.astimezone(timezone.utc)
 
     print("\n=== STEP 6.1: Logistic Risk-Event + Calibration Guard + Top-K ===")
+    event_params = f"sigma_mult={cfg.sigma_mult}" if cfg.event_rule == "sigma" else f"q={cfg.event_quantile:.2f}"
+
     print(
         "Config: "
         f"market={cfg.market} target={cfg.target_name} h={cfg.horizon_days} "
-        f"rule={cfg.event_rule} sigma_mult={cfg.sigma_mult} "
+        f"rule={cfg.event_rule} {event_params} "
         f"test={cfg.test_window_days} calib={cfg.calib_window_days} "
-        f"calib_split={cfg.calib_split} allow_iso={cfg.allow_isotonic}"
+        f"calib_split={cfg.calib_split} allow_iso={cfg.allow_isotonic} "
+        f"as_of_ts={cfg.as_of_ts.isoformat()}"
     )
 
-    # 1) build matrix
-    df = build_training_matrix(
+    # 1) build leakage-safe matrix
+    df = build_training_matrix_asof(
         market=cfg.market,
+        as_of_ts=cfg.as_of_ts,
         feature_version=cfg.feature_version,
         target_name=cfg.target_name,
         horizon_days=cfg.horizon_days,
@@ -679,22 +742,20 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
         test_n=int(cfg.test_window_days),
         calib_n=int(cfg.calib_window_days),
         mode=cfg.calib_split,
-        fit_max_rows=getattr(cfg, "fit_max_rows", None),
-        fit_tail_only=getattr(cfg, "fit_tail_only", True),
-        debug_splits=getattr(cfg, "debug_splits", False),
+        fit_max_rows=cfg.fit_max_rows,
+        fit_tail_only=cfg.fit_tail_only,
+        debug_splits=cfg.debug_splits,
     )
-
     print(f"Rows total: {len(df)} | Fit: {len(fit_df)} | Calib: {len(calib_df)} | Test: {len(test_df)}")
 
-    # 3) fit event definition on FIT only
+    # 3) event definition on FIT only
     evdef = _fit_event_definition(fit_df, cfg=cfg)
 
-    # 4) labels (consistent)
-    y_fit, thresh_fit = _make_event_labels(fit_df, cfg=cfg, evdef=evdef)
-    y_calib, thresh_calib = _make_event_labels(calib_df, cfg=cfg, evdef=evdef)
-    y_test, thresh_test = _make_event_labels(test_df, cfg=cfg, evdef=evdef)
+    # 4) labels
+    y_fit, _ = _make_event_labels(fit_df, cfg=cfg, evdef=evdef)
+    y_calib, _ = _make_event_labels(calib_df, cfg=cfg, evdef=evdef)
+    y_test, _ = _make_event_labels(test_df, cfg=cfg, evdef=evdef)
 
-    # pretty print event rule
     if cfg.event_rule == "sigma":
         assert evdef.vol_col is not None
         print(
@@ -706,28 +767,17 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
 
     print(f"Event rates: fit={y_fit.mean():.3f}, calib={y_calib.mean():.3f}, test={y_test.mean():.3f}")
 
-    if cfg.event_rule == "sigma":
-        ts = pd.Series(thresh_test).dropna()
-        if not ts.empty:
-            q05, q50, q95 = np.quantile(ts.values, [0.05, 0.50, 0.95])
-            print(f"Threshold stats (test): mean={ts.mean():.6f} p05={q05:.6f} p50={q50:.6f} p95={q95:.6f}")
-    else:
-        ts = pd.Series(thresh_test).dropna()
-        if not ts.empty:
-            print(f"Threshold (quantile cut): {float(ts.iloc[0]):.6f}")
-
     # 5) model
-    feature_cols = [c for c in df.columns if c not in ("market", "as_of_date", "target_value")]
-    X_fit = fit_df[feature_cols].astype(float).values
-    X_calib = calib_df[feature_cols].astype(float).values
-    X_test = test_df[feature_cols].astype(float).values
+    feature_cols = _select_feature_columns(df)
 
-    cw = "balanced" if cfg.horizon_days == 5 else None
+    X_fit = fit_df[feature_cols].apply(pd.to_numeric, errors="coerce").astype(float).values
+    X_calib = calib_df[feature_cols].apply(pd.to_numeric, errors="coerce").astype(float).values
+    X_test = test_df[feature_cols].apply(pd.to_numeric, errors="coerce").astype(float).values
 
     base = LogisticRegression(
         solver="lbfgs",
         max_iter=2000,
-        class_weight=cw,
+        class_weight=cfg.class_weight,
     )
     base.fit(X_fit, y_fit)
 
@@ -739,16 +789,53 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
     p_calib_raw = base.predict_proba(X_calib)[:, 1]
     p_test_raw = base.predict_proba(X_test)[:, 1]
 
+    # ---------------------------
+    # Direction: decide on FIT only
+    # ---------------------------
+    auc_fit_raw = float("nan")
+    if _has_both_classes(y_fit):
+        auc_fit_raw = float(roc_auc_score(y_fit, np.clip(p_fit_raw, 1e-9, 1 - 1e-9)))
+
+    flipped = False
+    if np.isfinite(auc_fit_raw) and auc_fit_raw < 0.5:
+        flipped = True
+        print(f"WARNING: fit AUC indicates inversion ({auc_fit_raw:.4f}); flipping direction.")
+        s_fit = -s_fit
+        s_calib = -s_calib
+        s_test = -s_test
+        p_fit_raw = 1.0 - p_fit_raw
+        p_calib_raw = 1.0 - p_calib_raw
+        p_test_raw = 1.0 - p_test_raw
+
+    print(f"[direction] auc_fit_raw={auc_fit_raw:.4f} flipped={flipped}")
     print(f"p_calib_raw: {_prob_stats(p_calib_raw)}")
     print(f"p_test_raw:  {_prob_stats(p_test_raw)}")
     print(f"Class rates: y_fit={y_fit.mean():.3f} | y_calib={y_calib.mean():.3f} | y_test={y_test.mean():.3f}")
+
+    # ---------------------------
+    # CALIB inversion diagnostic + safe fallback
+    # ---------------------------
+    auc_calib_raw = float("nan")
+    calib_inverted = False
+    if _has_both_classes(y_calib):
+        auc_calib_raw = float(roc_auc_score(y_calib, np.clip(p_calib_raw, 1e-9, 1 - 1e-9)))
+        if np.isfinite(auc_calib_raw) and auc_calib_raw < 0.5:
+            calib_inverted = True
+            print(
+                f"WARNING: calib AUC is inverted (auc_calib_raw={auc_calib_raw:.4f}). "
+                "Disabling CALIB-based calibration selection; using FIT-based selection for stream choice."
+            )
 
     can_calibrate = _has_both_classes(y_calib)
 
     p_calib_iso: np.ndarray | None = None
     p_test_iso: np.ndarray | None = None
+    p_fit_iso: np.ndarray | None = None
+
+    p_fit_sig: np.ndarray | None = None
     p_calib_sig: np.ndarray | None = None
     p_test_sig: np.ndarray | None = None
+
     a: float | None = None
     b: float | None = None
     iso: IsotonicRegression | None = None
@@ -756,84 +843,114 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
     if not can_calibrate:
         print("WARNING: calib split has a single class; skipping isotonic/sigmoid calibration.")
     else:
+        # ---- Isotonic (only for 5d)
         if cfg.allow_isotonic:
             try:
                 iso = IsotonicRegression(out_of_bounds="clip")
-                iso.fit(p_calib_raw, y_calib)
-                p_calib_iso = iso.predict(p_calib_raw)
-                p_test_iso = iso.predict(p_test_raw)
+                # IMPORTANT: fit on score (monotonic in score)
+                iso.fit(s_calib, y_calib)
+                p_calib_iso = iso.predict(s_calib)
+                p_test_iso = iso.predict(s_test)
+                p_fit_iso = iso.predict(s_fit)
             except Exception as e:
                 print(f"Calibration isotonic skipped due to error: {e}")
-                p_calib_iso = None
-                p_test_iso = None
                 iso = None
+                p_calib_iso = p_test_iso = p_fit_iso = None
         else:
             print("Isotonic disabled by config (recommended for h>=21).")
 
+        # ---- Platt / Sigmoid (fit on CALIB)
         try:
             a, b = _platt_fit(s_calib, y_calib)
-            print(f"Platt params: a={a:.6f} b={b:.6f}")
-            p_calib_sig = _platt_predict(s_calib, a, b)
-            p_test_sig = _platt_predict(s_test, a, b)
+
+            # If Platt stream is inverted on FIT, fix by flipping scores fed into Platt
+            auc_fit_sig = float("nan")
+            if _has_both_classes(y_fit):
+                p_fit_sig_tmp = _platt_predict(s_fit, a, b)
+                auc_fit_sig = float(roc_auc_score(y_fit, np.clip(p_fit_sig_tmp, 1e-9, 1 - 1e-9)))
+
+            if np.isfinite(auc_fit_sig) and auc_fit_sig < 0.5:
+                print(
+                    f"WARNING: Platt inverted on FIT (auc={auc_fit_sig:.4f}); "
+                    "flipping scores for sigmoid stream."
+                )
+                p_fit_sig = _platt_predict(-s_fit, a, b)
+                p_calib_sig = _platt_predict(-s_calib, a, b)
+                p_test_sig = _platt_predict(-s_test, a, b)
+            else:
+                p_fit_sig = _platt_predict(s_fit, a, b)
+                p_calib_sig = _platt_predict(s_calib, a, b)
+                p_test_sig = _platt_predict(s_test, a, b)
+
+            print(f"Platt params: a={a:.6f} b={b:.6f} | auc_fit_sig={auc_fit_sig:.4f}")
+
         except Exception as e:
             print(f"Calibration sigmoid skipped due to error: {e}")
-            p_calib_sig = None
-            p_test_sig = None
+            p_fit_sig = p_calib_sig = p_test_sig = None
+            a = b = None
 
+    # ---------------------------
+    # Stream selection (PERFECTED):
+    #   - Normal: choose stream based on CALIB metrics/guards
+    #   - If CALIB inverted: choose stream based on FIT metrics/guards (stable fallback)
+    # ---------------------------
     chosen = "raw"
-    calib_scores = {"chosen": {"name": "raw"}}
-    if can_calibrate:
-        chosen, calib_scores = _select_best_calibration(
-            y_calib=y_calib,
-            p_calib_raw=p_calib_raw,
-            p_calib_sig=p_calib_sig,
-            p_calib_iso=p_calib_iso,
-            min_improve=1e-6,
-            p_std_min=_p_std_min_for_horizon(cfg.horizon_days),
-            unique_ratio_min=0.10 if cfg.horizon_days == 5 else 0.05,
-        )
+    calib_scores: dict = {"chosen": {"name": "raw"}, "rejected": {}, "selection_label": {"label": "none"}}
 
+    p_std_min = cfg.p_std_min if cfg.p_std_min is not None else _p_std_min_for_horizon(cfg.horizon_days)
+
+    if can_calibrate:
+        if calib_inverted:
+            chosen, calib_scores = _select_best_calibration(
+                y_ref=y_fit,
+                p_raw=p_fit_raw,
+                p_sig=p_fit_sig,
+                p_iso=p_fit_iso,
+                min_improve=1e-6,
+                spread_min=cfg.spread_min,
+                p_std_min=p_std_min,
+                unique_ratio_min=cfg.unique_ratio_min,
+                min_levels=cfg.min_levels,
+                max_auc_drop=cfg.max_auc_drop,
+                max_ap_drop=cfg.max_ap_drop,
+                label="fit_fallback_due_to_calib_inversion",
+            )
+        else:
+            chosen, calib_scores = _select_best_calibration(
+                y_ref=y_calib,
+                p_raw=p_calib_raw,
+                p_sig=p_calib_sig,
+                p_iso=p_calib_iso,
+                min_improve=1e-6,
+                spread_min=cfg.spread_min,
+                p_std_min=p_std_min,
+                unique_ratio_min=cfg.unique_ratio_min,
+                min_levels=cfg.min_levels,
+                max_auc_drop=cfg.max_auc_drop,
+                max_ap_drop=cfg.max_ap_drop,
+                label="calib",
+            )
+
+    p_fit_prod = _build_prod_probs_from_choice(chosen=chosen, p_raw=p_fit_raw, p_sig=p_fit_sig, p_iso=p_fit_iso)
     p_calib_prod = _build_prod_probs_from_choice(chosen=chosen, p_raw=p_calib_raw, p_sig=p_calib_sig, p_iso=p_calib_iso)
     p_test_prod = _build_prod_probs_from_choice(chosen=chosen, p_raw=p_test_raw, p_sig=p_test_sig, p_iso=p_test_iso)
 
-    print(f"Calibration selection (by calib set): chosen={chosen} | scores={calib_scores}")
-
-    p_fit_sig: np.ndarray | None = None
-    p_fit_iso: np.ndarray | None = None
-    if a is not None and b is not None:
-        p_fit_sig = _platt_predict(s_fit, a, b)
-    if iso is not None:
-        p_fit_iso = iso.predict(p_fit_raw)
-
-    p_fit_prod = _build_prod_probs_from_choice(chosen=chosen, p_raw=p_fit_raw, p_sig=p_fit_sig, p_iso=p_fit_iso)
+    print(f"Calibration selection: chosen={chosen} | scores={calib_scores}")
 
     platt_params = {"a": float(a), "b": float(b)} if (can_calibrate and a is not None and b is not None) else None
 
-    # 7) base-rate alignment
+    # ---------------------------
+    # Base-rate alignment (intercept-only correction)
+    # ---------------------------
+    prior_correction_meta = {"enabled": False}
     if cfg.apply_prior_correction:
-        anchor = cfg.prior_anchor  # "fit" or "calib"
-        if anchor == "fit":
-            y_anchor = y_fit
-            p_anchor = p_fit_prod
-        else:
-            y_anchor = y_calib
-            p_anchor = p_calib_prod
+        anchor = cfg.prior_anchor
+        y_anchor = y_fit if anchor == "fit" else y_calib
+        p_anchor = p_fit_prod if anchor == "fit" else p_calib_prod
 
         pi_anchor = float(np.mean(y_anchor))
         pbar_anchor = float(np.mean(p_anchor))
         shift = _solve_intercept_shift(p_anchor, pi_anchor)
-
-        prior_correction_meta = {
-            "enabled": True,
-            "anchor": anchor,
-            "horizon_days": int(cfg.horizon_days),
-            "chosen_stream": str(chosen),
-            "pi_anchor": float(pi_anchor),
-            "pbar_anchor": float(pbar_anchor),
-            "shift_logit": float(shift),
-            "calib_mean_before": float(np.mean(p_calib_prod)),
-            "test_mean_before": float(np.mean(p_test_prod)),
-        }
 
         def _brier_ll(y, p):
             p = np.clip(np.asarray(p, float), 1e-9, 1 - 1e-9)
@@ -843,17 +960,25 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
         p_anchor_after = _apply_intercept_shift(p_anchor, shift)
         b_after, ll_after = _brier_ll(y_anchor, p_anchor_after)
 
-        apply_shift = (b_after <= b_before + 1e-6) and (ll_after <= ll_before + 1e-6)
+        shift_max = 6.0
+        apply_shift = (ll_after <= ll_before + 1e-6) and (abs(shift) <= shift_max)
 
-        prior_correction_meta.update(
-            {
-                "anchor_brier_before": b_before,
-                "anchor_logloss_before": ll_before,
-                "anchor_brier_after": b_after,
-                "anchor_logloss_after": ll_after,
-                "applied": bool(apply_shift),
-            }
-        )
+        prior_correction_meta = {
+            "enabled": True,
+            "anchor": anchor,
+            "horizon_days": int(cfg.horizon_days),
+            "chosen_stream": str(chosen),
+            "pi_anchor": float(pi_anchor),
+            "pbar_anchor": float(pbar_anchor),
+            "shift_logit": float(shift),
+            "anchor_brier_before": b_before,
+            "anchor_logloss_before": ll_before,
+            "anchor_brier_after": b_after,
+            "anchor_logloss_after": ll_after,
+            "applied": bool(apply_shift),
+            "calib_mean_before": float(np.mean(p_calib_prod)),
+            "test_mean_before": float(np.mean(p_test_prod)),
+        }
 
         if apply_shift:
             p_fit_prod = _apply_intercept_shift(p_fit_prod, shift)
@@ -873,10 +998,8 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
             f"calib_mean {prior_correction_meta['calib_mean_before']:.4f}->{prior_correction_meta['calib_mean_after']:.4f} "
             f"test_mean {prior_correction_meta['test_mean_before']:.4f}->{prior_correction_meta['test_mean_after']:.4f}"
         )
-    else:
-        prior_correction_meta = {"enabled": False}
 
-    # 8B) reliability tables
+    # reliability
     rel_tables: dict[str, pd.DataFrame] = {}
     rel_tables["test_prod"] = _reliability_table(y_test, p_test_prod, n_bins=10)
     rel_tables["test_raw"] = _reliability_table(y_test, p_test_raw, n_bins=10)
@@ -891,11 +1014,6 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
         rel_tables["calib_sigmoid"] = _reliability_table(y_calib, p_calib_sig, n_bins=10)
     if p_calib_iso is not None:
         rel_tables["calib_isotonic"] = _reliability_table(y_calib, p_calib_iso, n_bins=10)
-
-    if not _has_both_classes(y_test):
-        print("NOTE: test set has a single class; reliability table may be less informative.")
-    if not _has_both_classes(y_calib):
-        print("NOTE: calib set has a single class; reliability table may be less informative.")
 
     print("\n--- Reliability (TEST: prod) ---")
     print(rel_tables["test_prod"].to_string(index=False))
@@ -915,23 +1033,21 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
     for w in windows:
         n_test = int(pd.to_datetime(test_df["as_of_date"], errors="coerce").notna().sum())
         mp = min(n_test, max(20, int(w * 0.5)))
-
-        rolling_frames.append(
-            _rolling_calibration(test_df, y_test, p_test_prod, window=w, min_periods=mp, label=f"test_prod_w{w}")
-        )
-        rolling_frames.append(
-            _rolling_calibration(test_df, y_test, p_test_raw, window=w, min_periods=mp, label=f"test_raw_w{w}")
-        )
+        rolling_frames.append(_rolling_calibration(test_df, y_test, p_test_prod, window=w, min_periods=mp, label=f"test_prod_w{w}"))
+        rolling_frames.append(_rolling_calibration(test_df, y_test, p_test_raw, window=w, min_periods=mp, label=f"test_raw_w{w}"))
 
     rolling_calib_df = pd.concat(rolling_frames, ignore_index=True)
+    latest_rows = (
+        rolling_calib_df.sort_values("as_of_date")
+        .groupby("label", as_index=False)
+        .tail(1)
+        .sort_values("label")
+    )
 
     print("\n--- Rolling Calibration Drift (latest per stream) ---")
-    latest_rows = (
-        rolling_calib_df.sort_values("as_of_date").groupby("label", as_index=False).tail(1).sort_values("label")
-    )
     print(latest_rows.to_string(index=False))
 
-    # ranking (Option A): ALWAYS rank by raw score for alerts
+    # ranking: always by score (Option A)
     rank_method: RankMethod = "score"
     rank_selection: dict = {
         "rank_method": "score",
@@ -950,7 +1066,6 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
         rows.append(_metrics("test_sigmoid", y_test, p_test_sig))
     if p_test_iso is not None:
         rows.append(_metrics("test_isotonic", y_test, p_test_iso))
-
     mdf = pd.DataFrame(rows).sort_values("brier", ascending=True)
 
     print("\n--- Test Probability Metrics (sorted by Brier, lower is better) ---")
@@ -964,7 +1079,6 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
         calib_rows.append(_metrics("calib_sigmoid", y_calib, p_calib_sig))
     if p_calib_iso is not None:
         calib_rows.append(_metrics("calib_isotonic", y_calib, p_calib_iso))
-
     calib_mdf = pd.DataFrame(calib_rows).sort_values("brier", ascending=True)
 
     print("\n--- Calib Probability Metrics (sorted by Brier, lower is better) ---")
@@ -973,16 +1087,14 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
     # alerts
     alert_rows: list[dict] = []
     alert_rows += _topk_alerts("prod", y_test, rank_score_test)
-
     alert_rows += _topk_alerts("debug_score", y_test, s_test)
     alert_rows += _topk_alerts("debug_prob", y_test, p_test_prod)
-
     adf = pd.DataFrame(alert_rows)
 
     print("\n--- Top-K Alert Summary (Test set) ---")
     print(adf.to_string(index=False))
 
-    # coefficients (top abs)
+    # coefficients
     coef = base.coef_.ravel()
     coef_df = pd.DataFrame({"feature": feature_cols, "coef": coef})
     coef_df["abs"] = coef_df["coef"].abs()
@@ -993,15 +1105,19 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
 
     # save artifacts
     stamp = _utc_now().strftime("%Y%m%d_%H%M%S")
-    tag = f"eventlogit_{cfg.event_rule}_topk_{cfg.market}_{cfg.target_name}_h{cfg.horizon_days}d_{stamp}"
+    rule_tag = (f"q{int(round(cfg.event_quantile * 100)):02d}" if cfg.event_rule == "quantile" else f"s{cfg.sigma_mult:.2f}")
+    tag = f"eventlogit_{cfg.event_rule}_{rule_tag}_topk_{cfg.market}_{cfg.target_name}_h{cfg.horizon_days}d_{stamp}"
     out_dir = Path(cfg.out_dir) / tag
     _ensure_dir(out_dir)
-    
+
     latest_rows.to_csv(out_dir / "rolling_calibration_drift.csv", index=False)
     rolling_calib_df.to_csv(out_dir / "rolling_calibration_drift_full.csv", index=False)
 
+    cfg_dict = cfg.__dict__.copy()
+    cfg_dict["as_of_ts"] = cfg.as_of_ts.isoformat() if cfg.as_of_ts is not None else None
+
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(cfg.__dict__, f, indent=2, default=str)
+        json.dump(cfg_dict, f, indent=2, default=str)
 
     with open(out_dir / "event_definition.json", "w", encoding="utf-8") as f:
         json.dump(
@@ -1026,14 +1142,12 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
         json.dump(prior_correction_meta, f, indent=2)
 
     mdf.to_csv(out_dir / "test_metrics.csv", index=False)
+    calib_mdf.to_csv(out_dir / "calib_metrics.csv", index=False)
     adf.to_csv(out_dir / "topk_alerts.csv", index=False)
     coef_df.to_csv(out_dir / "top_coefficients.csv", index=False)
 
     for name, rdf in rel_tables.items():
         rdf.to_csv(out_dir / f"reliability_{name}.csv", index=False)
-
-    rolling_calib_df.to_csv(out_dir / "rolling_calibration_test.csv", index=False)
-    calib_mdf.to_csv(out_dir / "calib_metrics.csv", index=False)
 
     with open(out_dir / "calibration_summary.json", "w", encoding="utf-8") as f:
         json.dump(
@@ -1047,17 +1161,16 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
                 "calib_split": cfg.calib_split,
                 "platt_params": platt_params,
                 "chosen_stream": chosen,
-                "calib_best_by_brier": calib_mdf.iloc[0].to_dict() if not calib_mdf.empty else None,
-                "test_best_by_brier": mdf.iloc[0].to_dict() if not mdf.empty else None,
-                "calibration_selection": calib_scores,
-                "rank_method": "score",
-                "rank_reason": "always_rank_by_score_option_A",
+                "calib_inverted": bool(calib_inverted),
+                "auc_fit_raw_for_direction": float(auc_fit_raw),
+                "auc_calib_raw_diagnostic": float(auc_calib_raw) if np.isfinite(auc_calib_raw) else None,
+                "as_of_ts": cfg.as_of_ts.isoformat(),
             },
             f,
             indent=2,
         )
 
-    scored = test_df[["market", "as_of_date", "target_value"]].copy()
+    scored = test_df[[c for c in ["market", "as_of_date", "forward_date", "target_value"] if c in test_df.columns]].copy()
     scored["y_event"] = y_test
     scored["p_prod"] = p_test_prod
     scored["p_raw"] = p_test_raw
