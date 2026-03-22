@@ -11,20 +11,12 @@ from google.cloud import bigquery
 from src.core.config import settings
 from src.ingest.write_raw import read_raw_series_asof
 
-# NOTE:
-# available_time must be EXACTLY as_of_date + horizon_days at 00:00:00 UTC (calendar days),
-# NOT business days and NOT run timestamp. This fixes strict validator failures.
-
-# Target rows are written into v3 tables/views, but the *row version tag* is controlled by settings.
-# This prevents the "views are v3 but data is tagged v2/v3" mismatch from breaking training.
 DEFAULT_TARGET_VERSION = settings.DEFAULT_TARGET_VERSION
 
-# Warehouse objects (keep your existing names)
 TARGETS_TABLE = "targets_v3"
 TARGETS_STAGE_TABLE = "targets_stage_v3"
-TARGETS_LATEST_VIEW = settings.TARGETS_LATEST_VIEW  # default: "targets_latest_v3" from settings
+TARGETS_LATEST_VIEW = settings.TARGETS_LATEST_VIEW  # e.g. "targets_latest_v3"
 
-# Step 7: multi-horizon defaults (immutable)
 DEFAULT_HORIZONS_DAYS: tuple[int, ...] = (5, 21, 63)
 
 
@@ -43,6 +35,7 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
 
     # Dates + numerics
     df["as_of_date"] = pd.to_datetime(df["as_of_date"]).dt.date
+    df["forward_date"] = pd.to_datetime(df["forward_date"]).dt.date
     df["target_value"] = pd.to_numeric(df["target_value"], errors="coerce")
     df["horizon_days"] = pd.to_numeric(df["horizon_days"], errors="coerce").astype("Int64")
 
@@ -57,24 +50,22 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _target_available_time(as_of_date_series: pd.Series, horizon_days: int) -> pd.Series:
+def _target_available_time_from_forward_date(forward_date_series: pd.Series) -> pd.Series:
     """
-    REQUIRED INVARIANT:
-      available_time == (as_of_date + horizon_days) at 00:00:00 UTC
+    Conservative availability policy aligned with features:
+      available_time = forward_date + 1 day @ 00:00 UTC
 
-    This matches validate_targets_latest strict equality check.
+    forward_date is the date of P_{t+h} (the close used to compute the forward return).
     """
-    # as_of_date_series can be date objects; convert to UTC midnight timestamps
-    asof = pd.to_datetime(as_of_date_series)
+    fwd = pd.to_datetime(forward_date_series)
 
-    # if timezone-naive, assume UTC midnight
-    if getattr(asof.dt, "tz", None) is None:
-        asof = asof.dt.tz_localize("UTC")
+    # force UTC midnight timestamps
+    if getattr(fwd.dt, "tz", None) is None:
+        fwd = fwd.dt.tz_localize("UTC")
     else:
-        asof = asof.dt.tz_convert("UTC")
+        fwd = fwd.dt.tz_convert("UTC")
 
-    # add calendar days (not business days)
-    return asof + pd.to_timedelta(int(horizon_days), unit="D")
+    return fwd + pd.Timedelta(days=1)
 
 
 def ensure_latest_view(client: bigquery.Client, project: str, dataset: str) -> None:
@@ -90,6 +81,7 @@ def ensure_latest_view(client: bigquery.Client, project: str, dataset: str) -> N
     SELECT
       market,
       as_of_date,
+      forward_date,
       target_name,
       target_value,
       horizon_days,
@@ -119,6 +111,9 @@ def build_targets_from_prices(
     Build forward log return targets:
       fwd_ret_{h}d_log = log(P_{t+h}) - log(P_t)
 
+    Also tracks:
+      forward_date = date of P_{t+h}
+
     Rows at the end without a forward value are dropped (NaN after shift).
     """
     df = prices[[time_col, price_col]].copy()
@@ -135,11 +130,14 @@ def build_targets_from_prices(
     for h in horizons_days:
         h = int(h)
         name = f"fwd_ret_{h}d_log"
+
         df[name] = df["logp"].shift(-h) - df["logp"]
+        df[f"{name}__forward_date"] = df[time_col].shift(-h)
 
-        tmp = df[[time_col, name]].rename(columns={name: "target_value"})
-        tmp = tmp.dropna(subset=["target_value"]).copy()
-
+        tmp = df[[time_col, name, f"{name}__forward_date"]].rename(
+            columns={name: "target_value", f"{name}__forward_date": "forward_date"}
+        )
+        tmp = tmp.dropna(subset=["target_value", "forward_date"]).copy()
         tmp["target_name"] = name
         tmp["horizon_days"] = h
         rows.append(tmp)
@@ -191,18 +189,13 @@ def build_and_write_targets_asof(
     targets["run_id"] = str(run_id)
     targets["computed_at"] = computed_at
 
-    # per-row available_time depends on horizon, and must be UTC midnight (calendar days)
-    blocks = []
-    for h in horizons_days:
-        h = int(h)
-        block = targets[targets["horizon_days"] == h].copy()
-        block["available_time"] = _target_available_time(block["as_of_date"], horizon_days=h)
-        blocks.append(block)
-    targets = pd.concat(blocks, ignore_index=True)
+    # availability: forward_date + 1 day (aligned w/ feature availability)
+    targets["available_time"] = _target_available_time_from_forward_date(targets["forward_date"])
 
     required = [
         "market",
         "as_of_date",
+        "forward_date",
         "target_name",
         "target_value",
         "horizon_days",
@@ -221,6 +214,7 @@ def build_and_write_targets_asof(
     schema = [
         bigquery.SchemaField("market", "STRING"),
         bigquery.SchemaField("as_of_date", "DATE"),
+        bigquery.SchemaField("forward_date", "DATE"),
         bigquery.SchemaField("target_name", "STRING"),
         bigquery.SchemaField("target_value", "FLOAT"),
         bigquery.SchemaField("horizon_days", "INT64"),
@@ -235,11 +229,11 @@ def build_and_write_targets_asof(
 
     insert_sql = f"""
     INSERT INTO `{target_table}` (
-      market, as_of_date, target_name, target_value,
+      market, as_of_date, forward_date, target_name, target_value,
       horizon_days, available_time, target_version, run_id, computed_at
     )
     SELECT
-      market, as_of_date, target_name, target_value,
+      market, as_of_date, forward_date, target_name, target_value,
       horizon_days, available_time, target_version, run_id, computed_at
     FROM `{stage_table}`
     """
