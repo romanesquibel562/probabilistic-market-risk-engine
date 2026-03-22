@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pandas as pd
 from google.cloud import bigquery
@@ -26,6 +26,12 @@ def _bq_client() -> bigquery.Client:
     return bigquery.Client(project=settings.GCP_PROJECT_ID)
 
 
+def _to_utc(as_of_ts: datetime) -> datetime:
+    if as_of_ts.tzinfo is None:
+        return as_of_ts.replace(tzinfo=timezone.utc)
+    return as_of_ts.astimezone(timezone.utc)
+
+
 def _validate_target_pair(target_name: str, horizon_days: int) -> None:
     """
     Only enforces pairing rules for forward-log-return targets.
@@ -39,6 +45,10 @@ def _validate_target_pair(target_name: str, horizon_days: int) -> None:
             f"Expected '{expected}'."
         )
 
+
+# -------------------------------------------------------------------
+# Features loaders
+# -------------------------------------------------------------------
 
 def load_features_wide(
     *,
@@ -77,23 +87,19 @@ def load_features_wide(
         market,
         as_of_date,
         feature_name,
-        feature_value
+        feature_value,
+        available_time
     FROM `{view_id}`
     WHERE {" AND ".join(where)}
     ORDER BY as_of_date, feature_name
     """
 
-    df_long = client.query(
-        sql,
-        job_config=bigquery.QueryJobConfig(query_parameters=params),
-    ).to_dataframe()
+    df_long = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
 
     if df_long.empty:
         return pd.DataFrame(columns=["market", "as_of_date"])
 
     # Optional: fail loudly if the latest view still contains duplicates
-    # for the same (market, as_of_date, feature_name). "first" in pivot
-    # can silently mask these issues.
     if strict_duplicates:
         dup_mask = df_long.duplicated(subset=["market", "as_of_date", "feature_name"], keep=False)
         if dup_mask.any():
@@ -121,6 +127,95 @@ def load_features_wide(
     wide.columns.name = None
     return wide
 
+
+def load_features_wide_asof(
+    *,
+    market: str,
+    as_of_ts: datetime,
+    feature_version: str = settings.DEFAULT_FEATURE_VERSION,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    strict_duplicates: bool = True,
+) -> pd.DataFrame:
+    """
+    Anti-leakage features loader:
+      reads from features_latest view AND enforces available_time <= as_of_ts.
+
+    Output columns:
+      market, as_of_date, <feature columns...>
+    """
+    as_of_ts = _to_utc(as_of_ts)
+
+    client = _bq_client()
+    project = settings.GCP_PROJECT_ID
+    dataset = settings.BQ_DATASET
+    view_id = f"{project}.{dataset}.{FEATURES_VIEW}"
+
+    where = [
+        "market = @market",
+        "feature_version = @feature_version",
+        "available_time <= @as_of_ts",
+    ]
+    params: list[bigquery.ScalarQueryParameter] = [
+        bigquery.ScalarQueryParameter("market", "STRING", market),
+        bigquery.ScalarQueryParameter("feature_version", "STRING", feature_version),
+        bigquery.ScalarQueryParameter("as_of_ts", "TIMESTAMP", as_of_ts),
+    ]
+
+    if start_date:
+        where.append("as_of_date >= @start_date")
+        params.append(bigquery.ScalarQueryParameter("start_date", "DATE", pd.to_datetime(start_date).date()))
+    if end_date:
+        where.append("as_of_date <= @end_date")
+        params.append(bigquery.ScalarQueryParameter("end_date", "DATE", pd.to_datetime(end_date).date()))
+
+    sql = f"""
+    SELECT
+        market,
+        as_of_date,
+        feature_name,
+        feature_value,
+        available_time
+    FROM `{view_id}`
+    WHERE {" AND ".join(where)}
+    ORDER BY as_of_date, feature_name
+    """
+
+    df_long = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
+
+    if df_long.empty:
+        return pd.DataFrame(columns=["market", "as_of_date"])
+
+    if strict_duplicates:
+        dup_mask = df_long.duplicated(subset=["market", "as_of_date", "feature_name"], keep=False)
+        if dup_mask.any():
+            sample = (
+                df_long.loc[dup_mask, ["market", "as_of_date", "feature_name"]]
+                .drop_duplicates()
+                .head(20)
+            )
+            raise ValueError(
+                "Duplicate feature rows detected for the same (market, as_of_date, feature_name). "
+                "This should not happen in a latest view. Sample:\n"
+                f"{sample.to_string(index=False)}"
+            )
+
+    wide = (
+        df_long.pivot_table(
+            index=["market", "as_of_date"],
+            columns="feature_name",
+            values="feature_value",
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    wide.columns.name = None
+    return wide
+
+
+# -------------------------------------------------------------------
+# Target loaders
+# -------------------------------------------------------------------
 
 def load_targets(
     *,
@@ -163,17 +258,76 @@ def load_targets(
         params.append(bigquery.ScalarQueryParameter("end_date", "DATE", pd.to_datetime(end_date).date()))
 
     sql = f"""
-    SELECT market, as_of_date, target_value
+    SELECT market, as_of_date, target_value, available_time
     FROM `{view_id}`
     WHERE {" AND ".join(where)}
     ORDER BY as_of_date
     """
 
-    return client.query(
-        sql,
-        job_config=bigquery.QueryJobConfig(query_parameters=params),
-    ).to_dataframe()
+    df = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
+    return df[["market", "as_of_date", "target_value"]]
 
+
+def load_targets_asof(
+    *,
+    market: str,
+    as_of_ts: datetime,
+    target_name: str,
+    horizon_days: int,
+    target_version: str = settings.DEFAULT_TARGET_VERSION,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """
+    Anti-leakage targets loader:
+      reads from targets_latest view AND enforces available_time <= as_of_ts.
+
+    Output columns:
+      market, as_of_date, target_value
+    """
+    as_of_ts = _to_utc(as_of_ts)
+
+    client = _bq_client()
+    project = settings.GCP_PROJECT_ID
+    dataset = settings.BQ_DATASET
+    view_id = f"{project}.{dataset}.{TARGETS_VIEW}"
+
+    where = [
+        "market = @market",
+        "target_version = @target_version",
+        "target_name = @target_name",
+        "horizon_days = @horizon_days",
+        "available_time <= @as_of_ts",
+    ]
+    params: list[bigquery.ScalarQueryParameter] = [
+        bigquery.ScalarQueryParameter("market", "STRING", market),
+        bigquery.ScalarQueryParameter("target_version", "STRING", target_version),
+        bigquery.ScalarQueryParameter("target_name", "STRING", target_name),
+        bigquery.ScalarQueryParameter("horizon_days", "INT64", horizon_days),
+        bigquery.ScalarQueryParameter("as_of_ts", "TIMESTAMP", as_of_ts),
+    ]
+
+    if start_date:
+        where.append("as_of_date >= @start_date")
+        params.append(bigquery.ScalarQueryParameter("start_date", "DATE", pd.to_datetime(start_date).date()))
+    if end_date:
+        where.append("as_of_date <= @end_date")
+        params.append(bigquery.ScalarQueryParameter("end_date", "DATE", pd.to_datetime(end_date).date()))
+
+    sql = f"""
+    SELECT market, as_of_date, target_value, available_time
+    FROM `{view_id}`
+    WHERE {" AND ".join(where)}
+    ORDER BY as_of_date
+    """
+
+    df = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params)).to_dataframe()
+    return df[["market", "as_of_date", "target_value"]]
+
+
+# -------------------------------------------------------------------
+# Training matrix builders
+# -------------------------------------------------------------------
 
 def build_training_matrix(
     *,
@@ -188,10 +342,9 @@ def build_training_matrix(
     strict_feature_duplicates: bool = True,
 ) -> pd.DataFrame:
     """
-    Join wide features to target series on (market, as_of_date).
+    Legacy join (NOT as-of safe). Kept for debugging/backfills.
 
-    - Drops rows where target is NULL (end-of-series forward shift).
-    - Optionally drops rows with NULL feature values (warmup windows).
+    Join wide features to target series on (market, as_of_date).
     """
     _validate_target_pair(target_name, horizon_days)
 
@@ -212,7 +365,67 @@ def build_training_matrix(
     )
 
     if X.empty or y.empty:
-        # Return a consistent schema even when empty.
+        cols = ["market", "as_of_date", "target_value"]
+        if not X.empty:
+            cols = list(X.columns) + ["target_value"]
+        return pd.DataFrame(columns=cols)
+
+    df = X.merge(y, on=["market", "as_of_date"], how="inner")
+    df = df.dropna(subset=["target_value"]).reset_index(drop=True)
+
+    if dropna_features and not df.empty:
+        feature_cols = [c for c in df.columns if c not in ("market", "as_of_date", "target_value")]
+        if feature_cols:
+            df = df.dropna(subset=feature_cols).reset_index(drop=True)
+
+    return df
+
+
+def build_training_matrix_asof(
+    *,
+    market: str,
+    as_of_ts: datetime,
+    feature_version: str = settings.DEFAULT_FEATURE_VERSION,
+    target_name: str = "fwd_ret_5d_log",
+    horizon_days: int = 5,
+    target_version: str = settings.DEFAULT_TARGET_VERSION,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    dropna_features: bool = True,
+    strict_feature_duplicates: bool = True,
+) -> pd.DataFrame:
+    """
+    Anti-leakage training matrix:
+
+      - pulls from latest views
+      - enforces features.available_time <= as_of_ts
+      - enforces targets.available_time <= as_of_ts
+      - joins on (market, as_of_date)
+
+    This makes your splits + calibration apples-to-apples and stable.
+    """
+    _validate_target_pair(target_name, horizon_days)
+    as_of_ts = _to_utc(as_of_ts)
+
+    X = load_features_wide_asof(
+        market=market,
+        as_of_ts=as_of_ts,
+        feature_version=feature_version,
+        start_date=start_date,
+        end_date=end_date,
+        strict_duplicates=strict_feature_duplicates,
+    )
+    y = load_targets_asof(
+        market=market,
+        as_of_ts=as_of_ts,
+        target_name=target_name,
+        horizon_days=horizon_days,
+        target_version=target_version,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    if X.empty or y.empty:
         cols = ["market", "as_of_date", "target_value"]
         if not X.empty:
             cols = list(X.columns) + ["target_value"]
