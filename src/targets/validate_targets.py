@@ -187,8 +187,3 @@ if __name__ == "__main__":
     #   python -m src.targets.validate_targets
 
 
-
-    # Run:
-    #   python -m src.targets.validate_targets
-
-
