@@ -241,3 +241,4 @@ def build_and_write_targets_asof(
 
     ensure_latest_view(client, project, dataset)
     return targets
+
