@@ -1,12 +1,10 @@
-# src/ingest/connectors/market_prices.py
 from __future__ import annotations
 
 import datetime as dt
 from datetime import datetime, timezone
-from io import StringIO
 
 import pandas as pd
-import requests
+import yfinance as yf
 
 
 def _available_time_utc_for_daily_close(as_of_date: dt.date) -> datetime:
@@ -20,21 +18,101 @@ def _available_time_utc_for_daily_close(as_of_date: dt.date) -> datetime:
     )
 
 
-def _normalize_stooq_symbol(symbol: str) -> str:
+def _normalize_yahoo_symbol(symbol: str) -> str:
     """
-    Normalize a user symbol into a Stooq symbol.
+    Normalize a symbol for Yahoo Finance usage.
 
     Examples:
-      "SPY" -> "spy.us"
-      "spy" -> "spy.us"
-      "spy.us" -> "spy.us"
+      "SPY" -> "SPY"
+      " spy " -> "SPY"
+      "spy.us" -> "SPY"
+      "SPY.US" -> "SPY"
     """
-    s = symbol.strip().lower()
-    if "." not in s:
-        s = f"{s}.us"
+    s = symbol.strip().upper()
+
+    # Old Stooq-style symbols like SPY.US should become SPY for yfinance
+    if s.endswith(".US"):
+        s = s[:-3]
+
     return s
 
 
+def fetch_daily_close_yfinance(
+    *,
+    symbol: str,
+    series_id: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch daily close from Yahoo Finance via yfinance.
+
+    Returns canonical raw schema:
+      series_id, source, as_of_date, value, available_time, ingested_at
+    """
+    ticker = _normalize_yahoo_symbol(symbol)
+
+    try:
+        df = yf.download(
+            tickers=ticker,
+            start=start,
+            end=end,
+            interval="1d",
+            auto_adjust=True,
+            repair=True,
+            progress=False,
+            threads=False,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"yfinance download failed for symbol={ticker}: {e}"
+        ) from e
+
+    if df is None or df.empty:
+        raise ValueError(
+            f"No data returned from yfinance for symbol={ticker}, start={start}, end={end}."
+        )
+
+    # Flatten any MultiIndex columns just in case
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    cols_lower = {str(c).lower(): c for c in df.columns}
+    close_col = cols_lower.get("close")
+
+    if close_col is None:
+        raise ValueError(
+            f"Expected a Close column from yfinance for symbol={ticker}. "
+            f"Columns found: {list(df.columns)}"
+        )
+
+    out = df[[close_col]].copy().reset_index()
+
+    # yfinance may return either 'Date' or a datetime-like index name
+    date_col = out.columns[0]
+    out = out.rename(columns={date_col: "as_of_date", close_col: "value"})
+
+    out["as_of_date"] = pd.to_datetime(out["as_of_date"], errors="coerce").dt.date
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+
+    out = out.dropna(subset=["as_of_date", "value"]).sort_values("as_of_date").reset_index(drop=True)
+
+    if out.empty:
+        raise ValueError(
+            f"yfinance returned rows, but none survived cleaning for symbol={ticker}."
+        )
+
+    out["series_id"] = series_id
+    out["source"] = "yfinance"
+    out["available_time"] = out["as_of_date"].apply(_available_time_utc_for_daily_close)
+    out["ingested_at"] = datetime.now(timezone.utc)
+
+    return out[
+        ["series_id", "source", "as_of_date", "value", "available_time", "ingested_at"]
+    ].reset_index(drop=True)
+
+
+# --- Backward compatibility wrappers ------------------------------------------
 def fetch_daily_close_stooq(
     *,
     symbol: str,
@@ -43,56 +121,27 @@ def fetch_daily_close_stooq(
     end: str | None = None,
 ) -> pd.DataFrame:
     """
-    Fetch daily close from Stooq for a given symbol.
-
-    Returns canonical raw schema:
-      series_id, source, as_of_date, value, available_time, ingested_at
+    Backward-compatible wrapper so the rest of the pipeline does not need
+    to change immediately. Internally uses yfinance now.
     """
-    sym = _normalize_stooq_symbol(symbol)
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-
-    df = pd.read_csv(StringIO(r.text))
-    df.columns = [c.lower() for c in df.columns]
-
-    # Expected columns: date, open, high, low, close, volume
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-    df = df.dropna(subset=["date"]).sort_values("date")
-
-    if start:
-        start_d = dt.date.fromisoformat(start)
-        df = df[df["date"] >= start_d]
-    if end:
-        end_d = dt.date.fromisoformat(end)
-        df = df[df["date"] <= end_d]
-
-    out = df[["date", "close"]].rename(
-        columns={"date": "as_of_date", "close": "value"}
-    ).copy()
-
-    out["series_id"] = series_id
-    out["source"] = "stooq"
-    out["available_time"] = out["as_of_date"].apply(_available_time_utc_for_daily_close)
-    out["ingested_at"] = datetime.now(timezone.utc)
-
-    out["value"] = pd.to_numeric(out["value"], errors="coerce")
-    out = out.dropna(subset=["value"])
-
-    return out.reset_index(drop=True)
+    return fetch_daily_close_yfinance(
+        symbol=symbol,
+        series_id=series_id,
+        start=start,
+        end=end,
+    )
 
 
-# --- Backward compatibility wrapper ------------------------------------------
 def fetch_spy_daily_stooq(start: str | None = None, end: str | None = None) -> pd.DataFrame:
     """
     Backward compatible wrapper for older code paths.
     """
-    return fetch_daily_close_stooq(
-        symbol="SPY",                 # normalized -> "spy.us"
+    return fetch_daily_close_yfinance(
+        symbol="SPY",
         series_id="mkt.spy_close",
         start=start,
         end=end,
     )
+
 
 
