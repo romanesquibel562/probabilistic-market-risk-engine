@@ -1,4 +1,3 @@
-# src/pipeline/daily_pipeline.py
 from __future__ import annotations
 
 import datetime as dt
@@ -61,6 +60,27 @@ def _normalize_as_of_ts(as_of_ts: dt.datetime | None) -> dt.datetime:
     return as_of_ts.astimezone(dt.timezone.utc)
 
 
+def _effective_lookback_days(
+    lookback_days: int,
+    *,
+    do_ridge_baseline: bool,
+    do_event_models: bool,
+) -> int:
+    """
+    Ensure enough history for modeling splits.
+
+    Short dev windows are fine for ETL-only runs, but event modeling and walk-forward-style
+    calibration need materially more history than a 550-day window.
+    """
+    lookback_days = int(lookback_days)
+
+    if do_event_models or do_ridge_baseline:
+        # Use ~10 years of daily history when modeling is enabled.
+        return max(lookback_days, 3650)
+
+    return lookback_days
+
+
 # ----------------------------
 # Main pipeline
 # ----------------------------
@@ -69,7 +89,7 @@ def run_daily_pipeline(
     *,
     market: str = "SPY",
     series_id: str = "mkt.spy_close",
-    lookback_days: int = 550,
+    lookback_days: int = 3650,
     as_of_ts: dt.datetime | None = None,
     horizons_days: Sequence[int] = DEFAULT_HORIZONS_DAYS,
     versions: PipelineVersions = PipelineVersions(),
@@ -109,9 +129,19 @@ def run_daily_pipeline(
     horizons = _as_list_int(horizons_days)
     horizons = sorted(set(horizons))
 
+    effective_lookback = _effective_lookback_days(
+        lookback_days,
+        do_ridge_baseline=do_ridge_baseline,
+        do_event_models=do_event_models,
+    )
+
     # Use the latest available market date *after ingest*, so we’ll compute it twice:
     # once for logging, and again after ingest in case new rows were written.
-    latest_date_pre = latest_market_date(series_id=series_id, as_of_ts=as_of_ts)
+    latest_date_pre = None
+    try:
+        latest_date_pre = latest_market_date(series_id=series_id, as_of_ts=as_of_ts)
+    except Exception as e:
+        print(f"latest_market_date (pre-ingest) unavailable yet: {e}")
 
     stages = {
         "ingest": do_ingest,
@@ -128,6 +158,8 @@ def run_daily_pipeline(
     print("market:", market, "| series_id:", series_id)
     print("versions:", {"feature_version": versions.feature_version, "target_version": versions.target_version})
     print("horizons_days:", horizons)
+    print("lookback_days requested:", lookback_days)
+    print("lookback_days effective:", effective_lookback)
     print("latest_market_date (pre-ingest):", latest_date_pre)
     print("stages:", stages)
 
@@ -142,7 +174,7 @@ def run_daily_pipeline(
     # Recompute latest date after ingest
     latest_date = latest_market_date(series_id=series_id, as_of_ts=as_of_ts)
     end_date = latest_date.isoformat()
-    start_date = (latest_date - dt.timedelta(days=int(lookback_days))).isoformat()
+    start_date = (latest_date - dt.timedelta(days=int(effective_lookback))).isoformat()
     print("latest_market_date (post-ingest):", latest_date)
     print("window:", start_date, "->", end_date)
 
@@ -181,7 +213,7 @@ def run_daily_pipeline(
     if do_validate:
         print("\n[4/7] Validate feature/target stores...")
         validate_features_latest(markets=[market], feature_version=versions.feature_version)
-        validate_targets_latest(market=[market], target_version=versions.target_version)
+        validate_targets_latest(market=market, target_version=versions.target_version)
 
     # 5) RIDGE BASELINE (optional)
     if do_ridge_baseline:
@@ -200,9 +232,11 @@ def run_daily_pipeline(
     if do_event_models:
         print("\n[6/7] Multi-horizon event models...")
         run_multi_horizon_event_suite(
-            market=market,  # just use the first market for modeling
+            market=market,
             feature_version=versions.feature_version,
+            target_version=versions.target_version,
             horizons=tuple(horizons),
+            as_of_ts=as_of_ts,
         )
 
     # 7) FRIENDLY SUMMARY CSV (optional)
