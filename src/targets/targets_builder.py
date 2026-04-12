@@ -50,6 +50,37 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _target_schema() -> list[bigquery.SchemaField]:
+    return [
+        bigquery.SchemaField("market", "STRING"),
+        bigquery.SchemaField("as_of_date", "DATE"),
+        bigquery.SchemaField("forward_date", "DATE"),
+        bigquery.SchemaField("target_name", "STRING"),
+        bigquery.SchemaField("target_value", "FLOAT"),
+        bigquery.SchemaField("horizon_days", "INT64"),
+        bigquery.SchemaField("available_time", "TIMESTAMP"),
+        bigquery.SchemaField("target_version", "STRING"),
+        bigquery.SchemaField("run_id", "STRING"),
+        bigquery.SchemaField("computed_at", "TIMESTAMP"),
+    ]
+
+
+def ensure_table_exists(
+    client: bigquery.Client,
+    table_id: str,
+    schema: list[bigquery.SchemaField],
+) -> None:
+    """
+    Create table if it does not exist.
+    """
+    try:
+        client.get_table(table_id)
+    except Exception:
+        table = bigquery.Table(table_id, schema=schema)
+        client.create_table(table)
+        print(f"Created table: {table_id}")
+
+
 def _target_available_time_from_forward_date(forward_date_series: pd.Series) -> pd.Series:
     """
     Conservative availability policy aligned with features:
@@ -59,7 +90,6 @@ def _target_available_time_from_forward_date(forward_date_series: pd.Series) -> 
     """
     fwd = pd.to_datetime(forward_date_series)
 
-    # force UTC midnight timestamps
     if getattr(fwd.dt, "tz", None) is None:
         fwd = fwd.dt.tz_localize("UTC")
     else:
@@ -188,8 +218,6 @@ def build_and_write_targets_asof(
     targets["target_version"] = str(target_version)
     targets["run_id"] = str(run_id)
     targets["computed_at"] = computed_at
-
-    # availability: forward_date + 1 day (aligned w/ feature availability)
     targets["available_time"] = _target_available_time_from_forward_date(targets["forward_date"])
 
     required = [
@@ -210,19 +238,10 @@ def build_and_write_targets_asof(
 
     stage_table = f"{project}.{dataset}.{TARGETS_STAGE_TABLE}"
     target_table = f"{project}.{dataset}.{TARGETS_TABLE}"
+    schema = _target_schema()
 
-    schema = [
-        bigquery.SchemaField("market", "STRING"),
-        bigquery.SchemaField("as_of_date", "DATE"),
-        bigquery.SchemaField("forward_date", "DATE"),
-        bigquery.SchemaField("target_name", "STRING"),
-        bigquery.SchemaField("target_value", "FLOAT"),
-        bigquery.SchemaField("horizon_days", "INT64"),
-        bigquery.SchemaField("available_time", "TIMESTAMP"),
-        bigquery.SchemaField("target_version", "STRING"),
-        bigquery.SchemaField("run_id", "STRING"),
-        bigquery.SchemaField("computed_at", "TIMESTAMP"),
-    ]
+    ensure_table_exists(client, stage_table, schema)
+    ensure_table_exists(client, target_table, schema)
 
     cfg = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", schema=schema)
     client.load_table_from_dataframe(targets, stage_table, job_config=cfg).result()
