@@ -48,6 +48,33 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _raw_schema() -> list[bigquery.SchemaField]:
+    return [
+        bigquery.SchemaField("series_id", "STRING"),
+        bigquery.SchemaField("source", "STRING"),
+        bigquery.SchemaField("as_of_date", "DATE"),
+        bigquery.SchemaField("value", "FLOAT"),
+        bigquery.SchemaField("available_time", "TIMESTAMP"),
+        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
+    ]
+
+
+def ensure_table_exists(
+    client: bigquery.Client,
+    table_id: str,
+    schema: list[bigquery.SchemaField],
+) -> None:
+    """
+    Create table if it does not exist.
+    """
+    try:
+        client.get_table(table_id)
+    except Exception:
+        table = bigquery.Table(table_id, schema=schema)
+        client.create_table(table)
+        print(f"Created table: {table_id}")
+
+
 def ensure_latest_view(client: bigquery.Client, project: str, dataset: str) -> None:
     """
     Create/update a view that returns the latest ingested row per (series_id, source, as_of_date).
@@ -76,9 +103,10 @@ def ensure_latest_view(client: bigquery.Client, project: str, dataset: str) -> N
 def upsert_raw_series(df: pd.DataFrame) -> None:
     """
     Production-safe raw ingest:
-      1) WRITE_TRUNCATE into stage table (current batch)
-      2) INSERT stage -> raw (append-only)
-      3) Maintain a deduping view (latest per key)
+      1) ensure target + stage tables exist
+      2) WRITE_TRUNCATE into stage table (current batch)
+      3) INSERT stage -> raw (append-only)
+      4) Maintain a deduping view (latest per key)
     """
     client = bigquery.Client(project=settings.GCP_PROJECT_ID)
     project = settings.GCP_PROJECT_ID
@@ -90,21 +118,17 @@ def upsert_raw_series(df: pd.DataFrame) -> None:
 
     stage_table = f"{project}.{dataset}.{STAGE_TABLE}"
     raw_table = f"{project}.{dataset}.{RAW_TABLE}"
+    schema = _raw_schema()
 
-    schema = [
-        bigquery.SchemaField("series_id", "STRING"),
-        bigquery.SchemaField("source", "STRING"),
-        bigquery.SchemaField("as_of_date", "DATE"),
-        bigquery.SchemaField("value", "FLOAT"),
-        bigquery.SchemaField("available_time", "TIMESTAMP"),
-        bigquery.SchemaField("ingested_at", "TIMESTAMP"),
-    ]
+    # Ensure both stage and raw tables exist before loading/inserting
+    ensure_table_exists(client, stage_table, schema)
+    ensure_table_exists(client, raw_table, schema)
 
     # 1) Load batch into staging
     stage_cfg = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", schema=schema)
     client.load_table_from_dataframe(df, stage_table, job_config=stage_cfg).result()
 
-    # Debug (keep for now; you can remove later)
+    # Debug / sanity check
     stage_check_sql = f"""
     SELECT COUNT(*) AS n, MIN(as_of_date) AS mind, MAX(as_of_date) AS maxd
     FROM `{stage_table}`
@@ -116,7 +140,7 @@ def upsert_raw_series(df: pd.DataFrame) -> None:
     )
     print("STAGE CHECK:", stage_check)
 
-    # 2) Append stage into raw (no MERGE / no partition DML issues)
+    # 2) Append stage into raw
     insert_sql = f"""
     INSERT INTO `{raw_table}` (series_id, source, as_of_date, value, available_time, ingested_at)
     SELECT series_id, source, as_of_date, value, available_time, ingested_at
@@ -124,10 +148,10 @@ def upsert_raw_series(df: pd.DataFrame) -> None:
     """
     client.query(insert_sql, project=client.project).result()
 
-    # 3) Ensure latest view exists (idempotent at read time)
+    # 3) Ensure latest view exists
     ensure_latest_view(client, project, dataset)
 
-    # Target check: count in view is the "effective" deduped set
+    # 4) View sanity check
     view_table = f"{project}.{dataset}.{LATEST_VIEW}"
     target_check_sql = f"""
     SELECT COUNT(*) AS n, MIN(as_of_date) AS mind, MAX(as_of_date) AS maxd
@@ -148,7 +172,6 @@ def read_raw_series_asof(series_id: str, as_of_ts: datetime) -> pd.DataFrame:
       - enforces available_time <= as_of_ts
     """
     if as_of_ts.tzinfo is None:
-        # Treat naive times as UTC to avoid silent local-time leakage bugs
         as_of_ts = as_of_ts.replace(tzinfo=timezone.utc)
     else:
         as_of_ts = as_of_ts.astimezone(timezone.utc)
