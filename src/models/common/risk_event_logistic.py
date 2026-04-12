@@ -1187,5 +1187,3 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
 
 
 
-
-
