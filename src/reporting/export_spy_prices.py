@@ -56,3 +56,9 @@ if __name__ == "__main__":
     export_spy_prices()
 
     # python -m src.reporting.export_spy_prices
+
+
+if __name__ == "__main__":
+    export_spy_prices()
+
+    # python -m src.reporting.export_spy_prices
