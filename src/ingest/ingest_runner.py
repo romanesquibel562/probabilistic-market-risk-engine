@@ -30,13 +30,13 @@ def _default_start_end(
 # Store connector params per market. This keeps ingest_runner "multi-market"
 # without needing 1 fetch function per ticker.
 #
-# NOTE: Stooq symbols vary by instrument.
-# - US ETFs commonly: "spy.us", "qqq.us", "iwm.us"
+# We now use Yahoo Finance under the hood, so symbols should be Yahoo-style.
+# Keep them simple where possible.
 MARKET_INGEST_REGISTRY: dict[str, dict[str, str]] = {
-    "SPY": {"series_id": "mkt.spy_close", "symbol": "spy.us"},
+    "SPY": {"series_id": "mkt.spy_close", "symbol": "SPY"},
     # Add more as you implement/verify symbols:
-    # "QQQ": {"series_id": "mkt.qqq_close", "symbol": "qqq.us"},
-    # "IWM": {"series_id": "mkt.iwm_close", "symbol": "iwm.us"},
+    # "QQQ": {"series_id": "mkt.qqq_close", "symbol": "QQQ"},
+    # "IWM": {"series_id": "mkt.iwm_close", "symbol": "IWM"},
 }
 
 
@@ -64,13 +64,18 @@ def run_market_ingest(
     series_id = meta["series_id"]
     symbol = meta["symbol"]
 
-    # Generic Stooq close fetch (canonical raw schema)
+    # Backward-compatible fetch wrapper; now uses yfinance underneath.
     df = fetch_daily_close_stooq(
         symbol=symbol,
         series_id=series_id,
         start=start,
         end=end,
     )
+
+    if df is None or df.empty:
+        raise ValueError(
+            f"No rows fetched for market={mkt}, symbol={symbol}, start={start}, end={end}."
+        )
 
     upsert_raw_series(df)
 
