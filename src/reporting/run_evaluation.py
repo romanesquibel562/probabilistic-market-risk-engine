@@ -10,6 +10,7 @@ from src.reporting.model_evaluator import (
     write_backtest_outputs,
     write_eval_outputs,
 )
+from src.reporting.product_summary import write_product_outputs
 
 
 def main() -> None:
@@ -41,9 +42,26 @@ def main() -> None:
         print("[run_evaluation] Wrote:", csv_path)
         print("[run_evaluation] Wrote:", md_path)
 
+    product_paths = write_product_outputs(
+        market=args.market,
+        as_of_date=args.as_of_date,
+    )
+    latest_paths = write_product_outputs(
+        market=args.market,
+        as_of_date="latest",
+    )
+    print("[run_evaluation] Wrote:", product_paths.signals_csv)
+    print("[run_evaluation] Wrote:", product_paths.history_csv)
+    print("[run_evaluation] Wrote:", product_paths.model_health_csv)
+    print("[run_evaluation] Wrote:", product_paths.state_json)
+    print("[run_evaluation] Refreshed:", latest_paths.state_json)
+
 
 if __name__ == "__main__":
     main()
+
+# Example:
+#   python -m src.reporting.run_evaluation --market SPY --latest-only --as-of-date 2026-03-01
 
 # Example:
 #   python -m src.reporting.run_evaluation --market SPY --latest-only --as-of-date 2026-03-01
