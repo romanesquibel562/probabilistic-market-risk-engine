@@ -60,6 +60,35 @@ def _compute_available_time(as_of_date_series: pd.Series) -> pd.Series:
     return dt_utc + pd.Timedelta(days=1)
 
 
+def _feature_schema() -> list[bigquery.SchemaField]:
+    return [
+        bigquery.SchemaField("market", "STRING"),
+        bigquery.SchemaField("as_of_date", "DATE"),
+        bigquery.SchemaField("feature_name", "STRING"),
+        bigquery.SchemaField("feature_value", "FLOAT"),
+        bigquery.SchemaField("available_time", "TIMESTAMP"),
+        bigquery.SchemaField("feature_version", "STRING"),
+        bigquery.SchemaField("run_id", "STRING"),
+        bigquery.SchemaField("computed_at", "TIMESTAMP"),
+    ]
+
+
+def ensure_table_exists(
+    client: bigquery.Client,
+    table_id: str,
+    schema: list[bigquery.SchemaField],
+) -> None:
+    """
+    Create table if it does not exist.
+    """
+    try:
+        client.get_table(table_id)
+    except Exception:
+        table = bigquery.Table(table_id, schema=schema)
+        client.create_table(table)
+        print(f"Created table: {table_id}")
+
+
 def ensure_latest_view(client: bigquery.Client, project: str, dataset: str) -> None:
     """
     Create/update a view that returns the latest computed row per
@@ -87,7 +116,8 @@ def ensure_latest_view(client: bigquery.Client, project: str, dataset: str) -> N
     """
     client.query(sql, project=client.project).result()
 
-def build_and_write_features_many_asof(  # <-- new
+
+def build_and_write_features_many_asof(
     *,
     markets: Iterable[tuple[str, str]],
     as_of_ts: datetime,
@@ -141,7 +171,6 @@ def build_and_write_features_many_asof(  # <-- new
     return pd.concat(out, ignore_index=True)
 
 
-
 def build_and_write_features_asof(
     *,
     market: str,
@@ -149,8 +178,8 @@ def build_and_write_features_asof(
     as_of_ts: datetime,
     run_id: str,
     feature_version: str = FEATURE_VERSION,
-    start_date: str | None = None,   # "YYYY-MM-DD"
-    end_date: str | None = None,     # "YYYY-MM-DD"
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> pd.DataFrame:
     """
     End-to-end Step 2 with optional date filters.
@@ -170,7 +199,6 @@ def build_and_write_features_asof(
             f"No raw rows returned for series_id={series_id} as_of_ts={as_of_ts}."
         )
 
-    # Optional filter window (DATE-grain)
     if start_date is not None:
         sd = pd.to_datetime(start_date).date()
         raw = raw[raw["as_of_date"] >= sd].copy()
@@ -214,17 +242,10 @@ def build_and_write_features_asof(
 
     stage_table = f"{project}.{dataset}.{FEATURES_STAGE_TABLE}"
     target_table = f"{project}.{dataset}.{FEATURES_TABLE}"
+    schema = _feature_schema()
 
-    schema = [
-        bigquery.SchemaField("market", "STRING"),
-        bigquery.SchemaField("as_of_date", "DATE"),
-        bigquery.SchemaField("feature_name", "STRING"),
-        bigquery.SchemaField("feature_value", "FLOAT"),
-        bigquery.SchemaField("available_time", "TIMESTAMP"),
-        bigquery.SchemaField("feature_version", "STRING"),
-        bigquery.SchemaField("run_id", "STRING"),
-        bigquery.SchemaField("computed_at", "TIMESTAMP"),
-    ]
+    ensure_table_exists(client, stage_table, schema)
+    ensure_table_exists(client, target_table, schema)
 
     # 4) load batch to stage
     stage_cfg = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", schema=schema)

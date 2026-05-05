@@ -1,11 +1,13 @@
 # src/reporting/export_spy_prices.py
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import pandas as pd
 
 from src.ingest.connectors.market_prices import fetch_daily_close_stooq
+from src.ingest.write_raw import read_raw_series_asof
 
 
 OUTPUT_PATH = Path("artifacts/outputs/spy_prices.csv")
@@ -14,10 +16,25 @@ OUTPUT_PATH = Path("artifacts/outputs/spy_prices.csv")
 def export_spy_prices() -> None:
     print("\n=== Export SPY Prices ===")
 
-    df = fetch_daily_close_stooq(
-        symbol="SPY",
-        series_id="SPY",
-    )
+    try:
+        df = read_raw_series_asof(
+            series_id="mkt.spy_close",
+            as_of_ts=pd.Timestamp.now(tz="UTC").to_pydatetime(),
+        )
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["series_id"] = "SPY"
+    except Exception:
+        df = None
+
+    if df is None or df.empty:
+        print("[export] cached warehouse prices unavailable, trying live fetch...")
+        df = fetch_daily_close_stooq(
+            symbol="SPY",
+            series_id="SPY",
+            start=(dt.date.today() - dt.timedelta(days=3650)).isoformat(),
+            end=dt.date.today().isoformat(),
+        )
 
     if df is None or df.empty:
         raise ValueError("No SPY data returned from fetch_daily_close_stooq().")
@@ -50,12 +67,6 @@ def export_spy_prices() -> None:
     print(f"[export] cleaned rows = {len(out)}")
     print(f"[export] date range    = {out['date'].min()} -> {out['date'].max()}")
     print(f"Saved to: {OUTPUT_PATH}")
-
-
-if __name__ == "__main__":
-    export_spy_prices()
-
-    # python -m src.reporting.export_spy_prices
 
 
 if __name__ == "__main__":

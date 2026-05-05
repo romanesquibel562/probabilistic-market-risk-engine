@@ -35,7 +35,7 @@ def load_dashboard_state(market: str = "SPY") -> dict:
 
 def load_signal_frames(
     market: str = "SPY",
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     state = load_dashboard_state(market=market)
 
     signals = pd.DataFrame(state.get("signals", []))
@@ -47,7 +47,7 @@ def load_signal_frames(
         if not df.empty and "as_of_date" in df.columns:
             df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce")
 
-    return signals, history, model_health, backtests
+    return state, signals, history, model_health, backtests
 
 
 def load_spy_prices() -> pd.DataFrame:

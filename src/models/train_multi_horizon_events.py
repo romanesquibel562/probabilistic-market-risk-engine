@@ -5,6 +5,7 @@ import datetime as dt
 
 from src.core.config import settings
 from src.models.common.risk_event_logistic import EventLogitConfig, run_step6_event_logistic
+from src.models.common.risk_event_xgboost import run_step6_event_xgboost
 
 
 def _banner(title: str) -> None:
@@ -169,6 +170,7 @@ def run_multi_horizon_event_suite(
     horizons: tuple[int, ...] = (5, 21, 63),
     run_sigma: bool = True,
     run_tail_shock: bool = True,
+    run_xgboost_sidecar: bool = True,
     tail_q: float = 0.10,
     as_of_ts: dt.datetime | None = None,
 ) -> None:
@@ -202,6 +204,11 @@ def run_multi_horizon_event_suite(
                 f"| feat={cfg.feature_version} | tgt_ver={cfg.target_version}"
             )
             run_step6_event_logistic(cfg)
+            if run_xgboost_sidecar:
+                try:
+                    run_step6_event_xgboost(cfg)
+                except Exception as e:
+                    print(f"WARNING: XGBoost sidecar skipped for h={h} rule={cfg.event_rule}: {e}")
 
         if run_tail_shock:
             cfg_q = _cfg_for_horizon_tail_shock(
@@ -218,6 +225,11 @@ def run_multi_horizon_event_suite(
                 f"| feat={cfg_q.feature_version} | tgt_ver={cfg_q.target_version}"
             )
             run_step6_event_logistic(cfg_q)
+            if run_xgboost_sidecar:
+                try:
+                    run_step6_event_xgboost(cfg_q)
+                except Exception as e:
+                    print(f"WARNING: XGBoost sidecar skipped for h={h} rule={cfg_q.event_rule}: {e}")
 
 
 def main() -> None:

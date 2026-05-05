@@ -3,9 +3,11 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 from src.core.config import settings
+from src.ingest.connectors.market_prices import MarketDataRateLimitError
 from src.ingest.ingest_runner import run_spy_ingest
 from src.ingest.latest_data import latest_market_date
 
@@ -81,6 +83,21 @@ def _effective_lookback_days(
     return lookback_days
 
 
+def _warn_if_stale_data(*, latest_date: dt.date, as_of_ts: dt.datetime, max_stale_days: int = 3) -> None:
+    age_days = (as_of_ts.date() - latest_date).days
+    print(f"data_freshness: latest_market_date={latest_date} | age_days={age_days}")
+    if age_days > max_stale_days:
+        print(
+            f"WARNING: data is stale by {age_days} calendar days relative to as_of_ts. "
+            "Outputs should be treated as cached research signals, not fresh market guidance."
+        )
+
+
+def _has_model_artifacts(prefix: str) -> bool:
+    models_dir = Path(__file__).resolve().parents[2] / "artifacts" / "models"
+    return any(models_dir.glob(f"{prefix}*"))
+
+
 # ----------------------------
 # Main pipeline
 # ----------------------------
@@ -103,6 +120,7 @@ def run_daily_pipeline(
     do_event_models: bool = True,
     # outputs (recruiter-friendly)
     do_friendly_summary: bool = True,
+    force_rebuild: bool = False,
 ) -> None:
     """
     One-command pipeline (Airflow-ready later, works now).
@@ -169,14 +187,53 @@ def run_daily_pipeline(
         if market != "SPY":
             print("WARNING: run_spy_ingest() is SPY-only. Skipping ingest for market != SPY.")
         else:
-            run_spy_ingest()
+            try:
+                run_spy_ingest()
+            except MarketDataRateLimitError as e:
+                if latest_date_pre is None:
+                    raise
+                print(
+                    "WARNING: live ingest hit a provider rate limit. "
+                    "Continuing with the latest cached warehouse snapshot."
+                )
+                print(f"ingest_warning: {e}")
+            except Exception:
+                if latest_date_pre is None:
+                    raise
+                print(
+                    "WARNING: live ingest failed, but cached warehouse data exists. "
+                    "Continuing with cached data."
+                )
+    else:
+        print("\n[1/7] Ingest skipped by flag.")
 
     # Recompute latest date after ingest
     latest_date = latest_market_date(series_id=series_id, as_of_ts=as_of_ts)
     end_date = latest_date.isoformat()
     start_date = (latest_date - dt.timedelta(days=int(effective_lookback))).isoformat()
+    data_changed = latest_date_pre is None or latest_date != latest_date_pre
     print("latest_market_date (post-ingest):", latest_date)
+    _warn_if_stale_data(latest_date=latest_date, as_of_ts=as_of_ts)
     print("window:", start_date, "->", end_date)
+
+    should_skip_expensive_rebuild = (
+        not force_rebuild
+        and latest_date_pre is not None
+        and not data_changed
+        and do_ingest
+        and _has_model_artifacts("eventxgb_")
+    )
+    if should_skip_expensive_rebuild:
+        print(
+            "pipeline_optimization: latest market date unchanged and force_rebuild=False. "
+            "Skipping feature/target/model rebuild stages to reduce runtime and BigQuery usage."
+        )
+        do_features = False
+        do_targets = False
+        do_validate = False
+        do_event_models = False
+        do_ridge_baseline = False
+        do_friendly_summary = False
 
     # 2) FEATURES
     if do_features:

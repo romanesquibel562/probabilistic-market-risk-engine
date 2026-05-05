@@ -1,0 +1,37 @@
+# =========================================
+# MARKET RISK ENGINE DEMO COMMANDS
+# =========================================
+
+# 1) Go to the project root
+cd C:\Users\roman\market_risk_engine
+
+# 2) Activate the virtual environment
+.\.venv\Scripts\Activate.ps1
+
+# 3) Normal backend refresh
+# Uses live ingest if available, otherwise falls back to cached warehouse data
+python main.py --skip-ui
+
+# 4) Full rebuild if you explicitly want to force recomputation
+# Use this only when you want the heavy run
+python main.py --skip-ui --force-rebuild
+
+# 5) If Yahoo is rate-limited and you want to skip live ingest entirely
+# This rebuilds from already stored warehouse data
+python main.py --skip-ui --no-ingest
+
+# 6) Refresh just the evaluation/dashboard artifacts
+# Useful if you already ran the pipeline and want updated UI data files
+python -m src.reporting.run_evaluation --market SPY --latest-only --as-of-date latest
+
+# 7) Launch the Streamlit dashboard
+streamlit run ui/app.py
+
+# 8) One-command full run including UI launch
+python main.py
+
+# 9) If you only want the core pipeline without the extra reporting wrapper
+python -m src.pipeline.daily_pipeline
+
+# 10) If you want to export the price history file used by the UI
+python -m src.reporting.export_spy_prices

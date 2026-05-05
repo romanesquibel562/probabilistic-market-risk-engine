@@ -12,6 +12,7 @@ import pandas as pd
 from src.reporting.model_evaluator import (
     build_backtest_eval_summary,
     build_model_eval_summary,
+    build_xgb_eval_summary,
 )
 
 
@@ -122,6 +123,91 @@ def _health_label(score: float) -> str:
     return "Fragile"
 
 
+def _freshness_status(age_days: int | float | None) -> str:
+    if age_days is None or pd.isna(age_days):
+        return "Unknown"
+    age_days = int(age_days)
+    if age_days <= 3:
+        return "Fresh"
+    if age_days <= 7:
+        return "Aging"
+    return "Stale"
+
+
+def _model_gate(
+    *,
+    health_score: float | None,
+    eval_auc: float | None,
+    topk_precision: float | None,
+    backtest_auc: float | None,
+) -> str:
+    hs = np.nan if health_score is None else float(health_score)
+    ea = np.nan if eval_auc is None else float(eval_auc)
+    tp = np.nan if topk_precision is None else float(topk_precision)
+    ba = np.nan if backtest_auc is None else float(backtest_auc)
+
+    if not np.isnan(hs) and hs >= 70 and ((not np.isnan(ea) and ea >= 0.53) or (not np.isnan(ba) and ba >= 0.53)) and ((np.isnan(tp)) or tp >= 0.12):
+        return "Approved"
+    if not np.isnan(hs) and hs >= 55 and ((np.isnan(ea)) or ea >= 0.51):
+        return "Watch"
+    if not np.isnan(hs) and hs >= 40:
+        return "Research Only"
+    return "Suppressed"
+
+
+def _consensus_action(probability: float, approved_ratio: float, freshness: str) -> str:
+    if freshness == "Stale":
+        return "Cached / Review Freshness"
+    if probability >= 0.28 and approved_ratio >= 0.4:
+        return "De-Risk Aggressively"
+    if probability >= 0.20:
+        return "Reduce Exposure"
+    if probability >= 0.12:
+        return "Monitor Closely"
+    return "Normal Risk Posture"
+
+
+def _agreement_label(spread: float) -> str:
+    if spread <= 0.04:
+        return "High Agreement"
+    if spread <= 0.10:
+        return "Mixed"
+    return "Low Agreement"
+
+
+def _strategy_edge_score(brier: float | None, auc: float | None, ap: float | None) -> float:
+    b = np.nan if brier is None else float(brier)
+    a = np.nan if auc is None else float(auc)
+    p = np.nan if ap is None else float(ap)
+
+    brier_part = max(0.0, 0.25 - b) * 300 if not np.isnan(b) else 0.0
+    auc_part = max(0.0, a - 0.50) * 200 if not np.isnan(a) else 0.0
+    ap_part = max(0.0, p - 0.10) * 120 if not np.isnan(p) else 0.0
+    return round(float(brier_part + auc_part + ap_part), 1)
+
+
+def _challenger_winner(
+    logistic_auc: float | None,
+    logistic_brier: float | None,
+    xgb_auc: float | None,
+    xgb_brier: float | None,
+) -> str:
+    la = np.nan if logistic_auc is None else float(logistic_auc)
+    lb = np.nan if logistic_brier is None else float(logistic_brier)
+    xa = np.nan if xgb_auc is None else float(xgb_auc)
+    xb = np.nan if xgb_brier is None else float(xgb_brier)
+
+    if np.isnan(xa):
+        return "Logistic Only"
+    if np.isnan(la):
+        return "XGBoost"
+    if xa >= la + 0.01 and (np.isnan(lb) or np.isnan(xb) or xb <= lb + 0.01):
+        return "XGBoost"
+    if la >= xa + 0.01 and (np.isnan(lb) or np.isnan(xb) or lb <= xb + 0.01):
+        return "Logistic"
+    return "Mixed"
+
+
 def _compute_health_score(
     brier: float | None,
     auc: float | None,
@@ -146,6 +232,7 @@ def build_dashboard_state(
 ) -> dict[str, Any]:
     history = _load_friendly_history(market=market, repo_root=repo_root)
     eval_df = build_model_eval_summary(market=market, repo_root=repo_root, latest_only=True)
+    xgb_df = build_xgb_eval_summary(market=market, repo_root=repo_root, latest_only=True)
     backtest_df = build_backtest_eval_summary(market=market, repo_root=repo_root, latest_only=True)
 
     if history.empty:
@@ -238,6 +325,37 @@ def build_dashboard_state(
             }
         )
 
+    xgb_subset = pd.DataFrame()
+    if not xgb_df.empty:
+        xgb_subset = xgb_df.copy()
+        xgb_subset["event_rule"] = xgb_subset["event_rule"].fillna("unknown")
+        xgb_subset["horizon_days"] = pd.to_numeric(
+            xgb_subset["horizon_days"], errors="coerce"
+        ).fillna(-1).astype(int)
+        xgb_subset = xgb_subset[
+            [
+                "event_rule",
+                "horizon_days",
+                "artifact_dir",
+                "m_brier",
+                "m_auc",
+                "m_ap",
+                "topk_precision_last",
+                "topk_recall_last",
+                "topk_f1_last",
+            ]
+        ].rename(
+            columns={
+                "artifact_dir": "xgb_artifact_dir",
+                "m_brier": "xgb_brier",
+                "m_auc": "xgb_auc",
+                "m_ap": "xgb_ap",
+                "topk_precision_last": "xgb_topk_precision",
+                "topk_recall_last": "xgb_topk_recall",
+                "topk_f1_last": "xgb_topk_f1",
+            }
+        )
+
     latest_signals = latest_signals.merge(
         eval_subset,
         on=["event_rule", "horizon_days"],
@@ -246,6 +364,11 @@ def build_dashboard_state(
     latest_signals = latest_signals.merge(
         backtest_subset,
         on=["market", "horizon_days"],
+        how="left",
+    )
+    latest_signals = latest_signals.merge(
+        xgb_subset,
+        on=["event_rule", "horizon_days"],
         how="left",
     )
 
@@ -260,6 +383,28 @@ def build_dashboard_state(
         )
     ]
     latest_signals["model_health_label"] = latest_signals["model_health_score"].apply(_health_label)
+    latest_signals["strategy_edge_score"] = [
+        _strategy_edge_score(brier, auc, ap)
+        for brier, auc, ap in zip(
+            latest_signals.get("mean_test_brier_prod", pd.Series(dtype=float)),
+            latest_signals.get("mean_test_auc_prod", pd.Series(dtype=float)),
+            latest_signals.get("mean_test_ap_prod", pd.Series(dtype=float)),
+        )
+    ]
+    latest_signals["model_gate"] = [
+        _model_gate(
+            health_score=hs,
+            eval_auc=ea,
+            topk_precision=tp,
+            backtest_auc=ba,
+        )
+        for hs, ea, tp, ba in zip(
+            latest_signals["model_health_score"],
+            latest_signals.get("evaluation_auc", pd.Series(dtype=float)),
+            latest_signals.get("evaluation_topk_precision", pd.Series(dtype=float)),
+            latest_signals.get("mean_test_auc_prod", pd.Series(dtype=float)),
+        )
+    ]
     latest_signals["recommendation"] = [
         _recommendation(prob, pct, score)
         for prob, pct, score in zip(
@@ -280,10 +425,51 @@ def build_dashboard_state(
     latest_signals["days_since_latest_signal"] = (
         today_utc - latest_signals["as_of_date"]
     ).dt.days
+    latest_signals["freshness_status"] = latest_signals["days_since_latest_signal"].apply(_freshness_status)
+    latest_signals["decision_use"] = np.where(
+        latest_signals["model_gate"].isin(["Approved", "Watch"]),
+        "Decision Candidate",
+        "Research Only",
+    )
+    latest_signals["challenger_winner"] = [
+        _challenger_winner(la, lb, xa, xb)
+        for la, lb, xa, xb in zip(
+            latest_signals.get("evaluation_auc", pd.Series(dtype=float)),
+            latest_signals.get("evaluation_brier", pd.Series(dtype=float)),
+            latest_signals.get("xgb_auc", pd.Series(dtype=float)),
+            latest_signals.get("xgb_brier", pd.Series(dtype=float)),
+        )
+    ]
+    latest_signals["xgb_available"] = latest_signals.get("xgb_auc", pd.Series(dtype=float)).notna()
 
     latest_signals = latest_signals.sort_values(
         ["horizon_days", "event_rule"]
     ).reset_index(drop=True)
+
+    approved = latest_signals[latest_signals["model_gate"].isin(["Approved", "Watch"])].copy()
+    if approved.empty:
+        approved = latest_signals.copy()
+
+    weights = approved["model_health_score"].clip(lower=1.0)
+    consensus_probability = float(np.average(approved["event_probability"], weights=weights))
+    approved_ratio = float(
+        latest_signals["model_gate"].isin(["Approved", "Watch"]).mean()
+    )
+    signal_spread = float(
+        pd.to_numeric(latest_signals["event_probability"], errors="coerce").max()
+        - pd.to_numeric(latest_signals["event_probability"], errors="coerce").min()
+    )
+    consensus = {
+        "probability": round(consensus_probability, 4),
+        "action": _consensus_action(
+            consensus_probability,
+            approved_ratio,
+            _freshness_status(latest_signals["days_since_latest_signal"].min()),
+        ),
+        "approved_ratio": round(approved_ratio, 3),
+        "signal_spread": round(signal_spread, 4),
+        "agreement": _agreement_label(signal_spread),
+    }
 
     model_health = latest_signals[
         [
@@ -292,6 +478,11 @@ def build_dashboard_state(
             "horizon_days",
             "model_health_score",
             "model_health_label",
+            "model_gate",
+            "decision_use",
+            "strategy_edge_score",
+            "challenger_winner",
+            "xgb_available",
             "evaluation_brier",
             "evaluation_auc",
             "evaluation_ap",
@@ -303,20 +494,42 @@ def build_dashboard_state(
             "mean_test_auc_prod",
             "mean_test_ap_prod",
             "chosen_stream_mode",
+            "xgb_brier",
+            "xgb_auc",
+            "xgb_ap",
+            "xgb_topk_precision",
+            "xgb_topk_recall",
+            "xgb_topk_f1",
         ]
     ].copy()
 
     latest_date = latest_signals["as_of_date"].max()
+    freshness_age_days = int(latest_signals["days_since_latest_signal"].min()) if not latest_signals.empty else None
     summary = {
         "market": market,
         "latest_as_of_date": latest_date.strftime("%Y-%m-%d") if pd.notna(latest_date) else None,
+        "freshness_age_days": freshness_age_days,
+        "freshness_status": _freshness_status(freshness_age_days),
         "signal_count": int(len(latest_signals)),
         "average_health_score": round(float(latest_signals["model_health_score"].mean()), 1),
+        "approved_signal_count": int(latest_signals["model_gate"].isin(["Approved", "Watch"]).sum()),
+        "suppressed_signal_count": int((latest_signals["model_gate"] == "Suppressed").sum()),
         "elevated_signal_count": int(
             latest_signals["recommendation"].isin(["High Alert", "Defensive"]).sum()
         ),
         "high_alert_count": int((latest_signals["recommendation"] == "High Alert").sum()),
         "average_probability": round(float(latest_signals["event_probability"].mean()), 4),
+        "consensus_probability": consensus["probability"],
+        "consensus_action": consensus["action"],
+        "signal_agreement": consensus["agreement"],
+        "xgb_available_count": int(latest_signals["xgb_available"].sum()),
+        "xgb_win_count": int((latest_signals["challenger_winner"] == "XGBoost").sum()),
+        "best_xgb_auc": round(
+            float(pd.to_numeric(xgb_df.get("m_auc"), errors="coerce").max()),
+            4,
+        )
+        if not xgb_df.empty
+        else None,
         "best_backtest_auc": round(
             float(pd.to_numeric(backtest_df.get("mean_test_auc_prod"), errors="coerce").max()),
             4,
@@ -336,6 +549,7 @@ def build_dashboard_state(
         ).to_dict(orient="records"),
         "model_health": model_health.to_dict(orient="records"),
         "backtests": backtest_df.to_dict(orient="records"),
+        "consensus": consensus,
         "summary": summary,
     }
 

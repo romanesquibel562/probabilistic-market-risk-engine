@@ -275,11 +275,13 @@ def build_model_eval_summary(
     market: Optional[str] = None,
     repo_root: Optional[Path] = None,
     latest_only: bool = True,
+    prefix_glob: str = "eventlogit*",
+    model_family: str = "logistic",
 ) -> pd.DataFrame:
     repo_root = repo_root or Path(__file__).resolve().parents[2]
     models_dir = repo_root / "artifacts" / "models"
 
-    run_dirs = sorted([p for p in models_dir.glob("eventlogit*") if p.is_dir()])
+    run_dirs = sorted([p for p in models_dir.glob(prefix_glob) if p.is_dir()])
 
     rows: list[dict] = []
     for run_dir in run_dirs:
@@ -287,7 +289,7 @@ def build_model_eval_summary(
         if market and meta.get("market") and meta["market"] != market:
             continue
 
-        row = {**meta, "artifact_dir": str(run_dir)}
+        row = {**meta, "artifact_dir": str(run_dir), "model_family": model_family}
 
         # run_meta (optional)
         run_meta_df = _read_first_existing_csv(run_dir, candidates=["run_meta.csv"])
@@ -375,6 +377,20 @@ def build_model_eval_summary(
     return out
 
 
+def build_xgb_eval_summary(
+    market: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+    latest_only: bool = True,
+) -> pd.DataFrame:
+    return build_model_eval_summary(
+        market=market,
+        repo_root=repo_root,
+        latest_only=latest_only,
+        prefix_glob="eventxgb*",
+        model_family="xgboost",
+    )
+
+
 def write_eval_outputs(
     df: pd.DataFrame,
     market: str,
@@ -444,6 +460,48 @@ def write_eval_outputs(
     preview_df = df[preview_cols] if preview_cols else df.head(10)
     lines.append(preview_df.to_string(index=False))
 
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return csv_path, md_path
+
+
+def write_xgb_eval_outputs(
+    df: pd.DataFrame,
+    market: str,
+    as_of_date: str,
+    repo_root: Optional[Path] = None,
+) -> Tuple[Path, Path]:
+    repo_root = repo_root or Path(__file__).resolve().parents[2]
+    outputs_dir = repo_root / "artifacts" / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = outputs_dir / f"xgb_model_eval_summary_{market}_{as_of_date}.csv"
+    md_path = outputs_dir / f"xgb_model_eval_report_{market}_{as_of_date}.md"
+
+    df.to_csv(csv_path, index=False)
+
+    lines: list[str] = []
+    lines.append(f"# XGBoost Challenger Summary ({market}) — {as_of_date}")
+    lines.append("")
+    lines.append(f"Rows: {len(df)}")
+    lines.append("")
+    preview_cols = [
+        c
+        for c in [
+            "market",
+            "event_rule",
+            "horizon_days",
+            "m_brier",
+            "m_auc",
+            "m_ap",
+            "topk_precision_last",
+            "topk_recall_last",
+            "topk_f1_last",
+            "artifact_dir",
+        ]
+        if c in df.columns
+    ]
+    preview_df = df[preview_cols] if preview_cols else df.head(20)
+    lines.append(preview_df.to_string(index=False))
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return csv_path, md_path
 

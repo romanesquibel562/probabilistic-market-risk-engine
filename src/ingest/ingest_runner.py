@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable
 import pandas as pd
 
 from src.ingest.connectors.market_prices import fetch_daily_close_stooq
+from src.ingest.latest_data import latest_market_date
 from src.ingest.write_raw import upsert_raw_series
 
 
@@ -24,6 +25,26 @@ def _default_start_end(
     if end is None:
         end = dt.date.today().isoformat()
     return start, end
+
+
+def _incremental_start_for_series(
+    *,
+    series_id: str,
+    fallback_start: str,
+    cushion_days: int = 10,
+) -> str:
+    """
+    Prefer a small incremental refresh window when the series already exists in the warehouse.
+    Falls back to the full-history start on cold start or read failure.
+    """
+    try:
+        latest_date = latest_market_date(
+            series_id=series_id,
+            as_of_ts=dt.datetime.now(dt.timezone.utc),
+        )
+        return (latest_date - dt.timedelta(days=cushion_days)).isoformat()
+    except Exception:
+        return fallback_start
 
 
 # --- Market ingest registry ---------------------------------------------------
@@ -59,10 +80,10 @@ def run_market_ingest(
         )
 
     start, end = _default_start_end(start, end, default_lookback_days=lookback_days)
-
     meta = MARKET_INGEST_REGISTRY[mkt]
     series_id = meta["series_id"]
     symbol = meta["symbol"]
+    start = _incremental_start_for_series(series_id=series_id, fallback_start=start)
 
     # Backward-compatible fetch wrapper; now uses yfinance underneath.
     df = fetch_daily_close_stooq(

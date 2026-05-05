@@ -9,7 +9,9 @@ from pathlib import Path
 from src.pipeline.daily_pipeline import run_daily_pipeline
 from src.reporting.export_spy_prices import export_spy_prices
 from src.reporting.run_evaluation import main as run_evaluation_main
+from src.core.config import settings
 
+settings.validate_required()
 
 def _run_streamlit(app_path: Path) -> None:
     cmd = [
@@ -37,6 +39,7 @@ def main() -> None:
     parser.add_argument("--no-validate", action="store_true")
     parser.add_argument("--no-event-models", action="store_true")
     parser.add_argument("--no-friendly-summary", action="store_true")
+    parser.add_argument("--force-rebuild", action="store_true")
     args = parser.parse_args()
 
     print("\n=== MARKET RISK ENGINE ORCHESTRATOR START ===")
@@ -52,6 +55,7 @@ def main() -> None:
             do_validate=not args.no_validate,
             do_event_models=not args.no_event_models,
             do_friendly_summary=not args.no_friendly_summary,
+            force_rebuild=args.force_rebuild,
         )
     else:
         print("\n[1/4] Skipping daily pipeline.")
