@@ -5,8 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -16,6 +14,8 @@ PROJECT_ROOT = CURRENT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from components.ai_explainer import render_ai_explainer  # noqa: E402
+from components.chart_utils import build_downside_history_chart, build_overlay_chart  # noqa: E402
 from components.data_loader import load_signal_frames, load_spy_prices  # noqa: E402
 
 
@@ -85,6 +85,11 @@ def _format_num(value: float | int | None, digits: int = 1) -> str:
     return f"{float(value):.{digits}f}"
 
 
+def _overlay_signal_label(event_rule: str, horizon_days: int, gate: str | None = None) -> str:
+    suffix = f" [{gate}]" if gate else ""
+    return f"{str(event_rule)} | {int(horizon_days)}d{suffix}"
+
+
 st.sidebar.title("Market Risk Engine")
 st.sidebar.caption("Decision-support dashboard for downside-risk monitoring")
 
@@ -95,6 +100,8 @@ selected_horizons = st.sidebar.multiselect(
     [5, 21, 63],
     default=[5, 21, 63],
 )
+history_window_years = st.sidebar.selectbox("History window", [1, 2, 3, 5], index=2)
+history_smoothing = st.sidebar.slider("History smoothing (days)", min_value=5, max_value=63, value=21, step=4)
 
 state, signals, history, model_health, backtests = load_signal_frames(market=market)
 prices = load_spy_prices()
@@ -117,6 +124,37 @@ signals["model_health_score"] = pd.to_numeric(signals["model_health_score"], err
 signals["strategy_edge_score"] = pd.to_numeric(signals.get("strategy_edge_score"), errors="coerce")
 if "challenger_winner" not in signals.columns:
     signals["challenger_winner"] = "Not Run"
+
+overlay_candidates = signals.copy()
+overlay_candidates["overlay_priority"] = overlay_candidates["model_gate"].map(
+    {"Approved": 0, "Watch": 1, "Research Only": 2, "Suppressed": 3}
+).fillna(4)
+overlay_candidates = overlay_candidates.sort_values(
+    by=["overlay_priority", "strategy_edge_score", "model_health_score", "event_probability"],
+    ascending=[True, False, False, False],
+)
+overlay_options = []
+overlay_lookup: dict[str, tuple[str, int]] = {}
+for row in overlay_candidates.itertuples():
+    if pd.isna(row.horizon_days):
+        continue
+    label = _overlay_signal_label(row.event_rule, int(row.horizon_days), row.model_gate)
+    if label not in overlay_lookup:
+        overlay_lookup[label] = (str(row.event_rule), int(row.horizon_days))
+        overlay_options.append(label)
+
+default_overlay = next(
+    (label for label in overlay_options if label.startswith("sigma | 21d")),
+    overlay_options[0] if overlay_options else None,
+)
+selected_overlay_label = st.sidebar.selectbox(
+    "Overlay signal",
+    overlay_options,
+    index=overlay_options.index(default_overlay) if default_overlay in overlay_options else 0,
+) if overlay_options else None
+selected_overlay = overlay_lookup.get(selected_overlay_label, ("sigma", 21))
+overlay_window = st.sidebar.selectbox("Overlay window", ["1Y", "2Y", "3Y", "Full"], index=1)
+show_overlay_markers = st.sidebar.toggle("Show overlay markers", value=False)
 
 if selected_horizons:
     signals = signals[signals["horizon_days"].isin(selected_horizons)].copy()
@@ -240,24 +278,14 @@ with chart_left:
     if history.empty:
         st.info("No history available yet.")
     else:
-        hist = history.copy()
-        hist["series"] = hist["event_rule"].astype(str) + " | " + hist["horizon_days"].astype(str) + "d"
-        fig = px.line(
-            hist,
-            x="as_of_date",
-            y="event_probability",
-            color="series",
-            markers=True,
-            labels={
-                "as_of_date": "Date",
-                "event_probability": "Probability",
-                "series": "Signal",
-            },
-            title="Multi-Horizon Downside Probability",
+        st.caption(
+            "Smoothed small-multiple view. Each row is one horizon, and the lines show the underlying risk rules without the clutter of every raw point."
         )
-        fig.update_layout(
-            legend_title_text="Signal",
-            margin=dict(l=20, r=20, t=60, b=20),
+        fig = build_downside_history_chart(
+            history,
+            title="Multi-Horizon Downside Probability",
+            smoothing_window=history_smoothing,
+            recent_years=history_window_years,
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -268,44 +296,78 @@ with chart_right:
     else:
         overlay = history.copy()
         overlay = overlay.sort_values("as_of_date")
-        sigma_21 = overlay[
-            (overlay["event_rule"].astype(str) == "sigma")
-            & (pd.to_numeric(overlay["horizon_days"], errors="coerce") == 21)
+        overlay_rule, overlay_horizon = selected_overlay
+        overlay_series = overlay[
+            (overlay["event_rule"].astype(str) == overlay_rule)
+            & (pd.to_numeric(overlay["horizon_days"], errors="coerce") == int(overlay_horizon))
         ][["as_of_date", "event_probability"]].copy()
-        sigma_21["event_probability"] = pd.to_numeric(sigma_21["event_probability"], errors="coerce")
+        overlay_series["event_probability"] = pd.to_numeric(
+            overlay_series["event_probability"], errors="coerce"
+        )
+        overlay_series = overlay_series.dropna(subset=["as_of_date", "event_probability"]).copy()
 
-        price_fig = go.Figure()
-        price_fig.add_trace(
-            go.Scatter(
-                x=prices["date"],
-                y=prices["close"],
-                name="SPY Close",
-                line=dict(color="#1f3b5d", width=2.2),
-                yaxis="y1",
-            )
-        )
-        if not sigma_21.empty:
-            price_fig.add_trace(
-                go.Scatter(
-                    x=sigma_21["as_of_date"],
-                    y=sigma_21["event_probability"],
-                    name="21d Sigma Risk",
-                    line=dict(color="#ad5c1f", width=2),
-                    yaxis="y2",
+        overlay_meta = signals[
+            (signals["event_rule"].astype(str) == overlay_rule)
+            & (pd.to_numeric(signals["horizon_days"], errors="coerce") == int(overlay_horizon))
+        ].head(1)
+
+        if overlay_series.empty:
+            st.info("No overlay risk series is available yet for the selected signal.")
+        else:
+            shared_start = overlay_series["as_of_date"].min()
+            shared_end = overlay_series["as_of_date"].max()
+            if overlay_window != "Full":
+                years = {"1Y": 365, "2Y": 730, "3Y": 1095}[overlay_window]
+                shared_start = max(shared_start, shared_end - pd.Timedelta(days=years))
+                overlay_series = overlay_series[overlay_series["as_of_date"] >= shared_start].copy()
+            shared_prices = prices[
+                (prices["date"] >= shared_start) & (prices["date"] <= shared_end)
+            ].copy()
+
+            if shared_prices.empty:
+                st.info("No overlapping SPY price window is available for the current risk series.")
+            else:
+                overlay_daily = pd.merge_asof(
+                    shared_prices[["date"]].sort_values("date"),
+                    overlay_series.rename(columns={"as_of_date": "date"}).sort_values("date"),
+                    on="date",
+                    direction="backward",
+                ).dropna(subset=["event_probability"])
+
+                update_points = overlay_series.copy()
+                update_points["delta"] = update_points["event_probability"].diff().abs()
+                update_points = update_points[
+                    update_points["delta"].fillna(1.0) >= 0.01
+                ].drop(columns=["delta"])
+                if update_points.empty:
+                    update_points = overlay_series.tail(min(12, len(overlay_series))).copy()
+
+                if not overlay_meta.empty:
+                    meta = overlay_meta.iloc[0]
+                    st.caption(
+                        f"Shared-window overlay from {shared_start.strftime('%Y-%m-%d')} "
+                        f"to {shared_end.strftime('%Y-%m-%d')}. "
+                        f"Current signal: {_format_pct(meta.get('event_probability'))} | "
+                        f"Gate: {meta.get('model_gate', 'n/a')} | "
+                        f"Health: {_format_num(meta.get('model_health_score'))}. "
+                        "Risk is held at the last known model estimate until the next update."
+                    )
+                else:
+                    st.caption(
+                        f"Shared-window overlay from {shared_start.strftime('%Y-%m-%d')} "
+                        f"to {shared_end.strftime('%Y-%m-%d')}. Risk is held at the last known model estimate "
+                        "until the next update."
+                    )
+
+                price_fig = build_overlay_chart(
+                    shared_prices,
+                    overlay_daily,
+                    update_points,
+                    risk_name=f"{overlay_horizon}d {str(overlay_rule).title()} Risk",
+                    show_markers=show_overlay_markers,
                 )
-            )
-        price_fig.update_layout(
-            margin=dict(l=20, r=20, t=40, b=20),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            yaxis=dict(title="SPY Close"),
-            yaxis2=dict(
-                title="Risk Probability",
-                overlaying="y",
-                side="right",
-                tickformat=".0%",
-            ),
-        )
-        st.plotly_chart(price_fig, use_container_width=True)
+                price_fig.update_xaxes(range=[shared_start, shared_end])
+                st.plotly_chart(price_fig, use_container_width=True)
 
 lower_left, lower_right = st.columns([1, 1])
 
@@ -413,6 +475,15 @@ with lower_right:
             use_container_width=True,
             hide_index=True,
         )
+
+render_ai_explainer(
+    page_key="overview",
+    state=state,
+    signals=signals,
+    history=history,
+    model_health=model_health,
+    backtests=backtests,
+)
 
 # python main.py --skip-ui
 # streamlit run ui/app.py

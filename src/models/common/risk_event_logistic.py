@@ -835,6 +835,7 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
     p_fit_sig: np.ndarray | None = None
     p_calib_sig: np.ndarray | None = None
     p_test_sig: np.ndarray | None = None
+    sigmoid_flip_scores = False
 
     a: float | None = None
     b: float | None = None
@@ -874,10 +875,12 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
                     f"WARNING: Platt inverted on FIT (auc={auc_fit_sig:.4f}); "
                     "flipping scores for sigmoid stream."
                 )
+                sigmoid_flip_scores = True
                 p_fit_sig = _platt_predict(-s_fit, a, b)
                 p_calib_sig = _platt_predict(-s_calib, a, b)
                 p_test_sig = _platt_predict(-s_test, a, b)
             else:
+                sigmoid_flip_scores = False
                 p_fit_sig = _platt_predict(s_fit, a, b)
                 p_calib_sig = _platt_predict(s_calib, a, b)
                 p_test_sig = _platt_predict(s_test, a, b)
@@ -888,6 +891,7 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
             print(f"Calibration sigmoid skipped due to error: {e}")
             p_fit_sig = p_calib_sig = p_test_sig = None
             a = b = None
+            sigmoid_flip_scores = False
 
     # ---------------------------
     # Stream selection (PERFECTED):
@@ -1182,6 +1186,50 @@ def run_step6_event_logistic(cfg: EventLogitConfig) -> None:
     if p_test_sig is not None:
         scored["p_sigmoid"] = p_test_sig
     scored.to_csv(out_dir / "test_scored.csv", index=False)
+
+    # Save a dense scored history so downstream dashboards can plot a
+    # continuous probability monitor instead of just the held-out test split.
+    y_full, _ = _make_event_labels(df, cfg=cfg, evdef=evdef)
+    X_full = df[feature_cols].apply(pd.to_numeric, errors="coerce").astype(float)
+    s_full = base.decision_function(X_full)
+    p_full_raw = base.predict_proba(X_full)[:, 1]
+    if flipped:
+        s_full = -s_full
+        p_full_raw = 1.0 - p_full_raw
+
+    p_full_sig: np.ndarray | None = None
+    if a is not None and b is not None and p_test_sig is not None:
+        s_full_sig = -s_full if sigmoid_flip_scores else s_full
+        p_full_sig = _platt_predict(s_full_sig, a, b)
+
+    p_full_iso: np.ndarray | None = None
+    if iso is not None and p_test_iso is not None:
+        p_full_iso = iso.predict(s_full)
+
+    p_full_prod = _build_prod_probs_from_choice(
+        chosen=chosen,
+        p_raw=p_full_raw,
+        p_sig=p_full_sig,
+        p_iso=p_full_iso,
+    )
+    if prior_correction_meta.get("applied"):
+        p_full_prod = _apply_intercept_shift(
+            p_full_prod,
+            float(prior_correction_meta.get("shift_logit", 0.0)),
+        )
+
+    full_scored = df[
+        [c for c in ["market", "as_of_date", "forward_date", "target_value"] if c in df.columns]
+    ].copy()
+    full_scored["y_event"] = y_full
+    full_scored["p_prod"] = p_full_prod
+    full_scored["p_raw"] = p_full_raw
+    full_scored["score_raw"] = s_full
+    if p_full_iso is not None:
+        full_scored["p_isotonic"] = p_full_iso
+    if p_full_sig is not None:
+        full_scored["p_sigmoid"] = p_full_sig
+    full_scored.to_csv(out_dir / "full_scored.csv", index=False)
 
     print(f"\nArtifacts saved to: {out_dir.as_posix()}")
 

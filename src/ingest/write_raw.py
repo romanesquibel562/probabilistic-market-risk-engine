@@ -105,7 +105,7 @@ def upsert_raw_series(df: pd.DataFrame) -> None:
     Production-safe raw ingest:
       1) ensure target + stage tables exist
       2) WRITE_TRUNCATE into stage table (current batch)
-      3) INSERT stage -> raw (append-only)
+      3) MERGE stage -> raw on the natural daily key
       4) Maintain a deduping view (latest per key)
     """
     client = bigquery.Client(project=settings.GCP_PROJECT_ID)
@@ -140,13 +140,24 @@ def upsert_raw_series(df: pd.DataFrame) -> None:
     )
     print("STAGE CHECK:", stage_check)
 
-    # 2) Append stage into raw
-    insert_sql = f"""
-    INSERT INTO `{raw_table}` (series_id, source, as_of_date, value, available_time, ingested_at)
-    SELECT series_id, source, as_of_date, value, available_time, ingested_at
-    FROM `{stage_table}`
+    # 2) Upsert stage into raw so repeat runs do not keep appending the same rows.
+    merge_sql = f"""
+    MERGE `{raw_table}` T
+    USING `{stage_table}` S
+    ON
+      T.series_id = S.series_id
+      AND T.source = S.source
+      AND T.as_of_date = S.as_of_date
+    WHEN MATCHED THEN
+      UPDATE SET
+        value = S.value,
+        available_time = S.available_time,
+        ingested_at = S.ingested_at
+    WHEN NOT MATCHED THEN
+      INSERT (series_id, source, as_of_date, value, available_time, ingested_at)
+      VALUES (S.series_id, S.source, S.as_of_date, S.value, S.available_time, S.ingested_at)
     """
-    client.query(insert_sql, project=client.project).result()
+    client.query(merge_sql, project=client.project).result()
 
     # 3) Ensure latest view exists
     ensure_latest_view(client, project, dataset)

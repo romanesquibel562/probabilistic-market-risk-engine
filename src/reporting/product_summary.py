@@ -43,6 +43,45 @@ def _safe_read_csv(path: Path) -> pd.DataFrame | None:
         return None
 
 
+def _load_scored_history_from_artifact(
+    *,
+    artifact_dir: str | None,
+    market: str,
+    event_rule: str,
+    horizon_days: int,
+) -> pd.DataFrame:
+    if not artifact_dir:
+        return pd.DataFrame()
+
+    artifact_path = Path(artifact_dir)
+    path = artifact_path / "full_scored.csv"
+    history_source = "artifact_full_scored"
+    df = _safe_read_csv(path)
+    if df is None or df.empty:
+        path = artifact_path / "test_scored.csv"
+        history_source = "artifact_test_scored"
+        df = _safe_read_csv(path)
+    if df is None or df.empty or "as_of_date" not in df.columns:
+        return pd.DataFrame()
+
+    prob_col = "p_prod" if "p_prod" in df.columns else "p_raw" if "p_raw" in df.columns else None
+    if prob_col is None:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(
+        {
+            "market": market,
+            "event_rule": event_rule,
+            "horizon_days": int(horizon_days),
+            "horizon": f"{int(horizon_days)}d",
+            "as_of_date": pd.to_datetime(df["as_of_date"], errors="coerce"),
+            "event_probability": pd.to_numeric(df[prob_col], errors="coerce"),
+            "history_source": history_source,
+        }
+    )
+    return out.dropna(subset=["as_of_date", "event_probability"]).sort_values("as_of_date").reset_index(drop=True)
+
+
 def _load_friendly_history(market: str, repo_root: Path | None = None) -> pd.DataFrame:
     outputs = _outputs_dir(repo_root)
     files = sorted(outputs.glob(f"friendly_risk_summary_{market}_*.csv"))
@@ -246,33 +285,9 @@ def build_dashboard_state(
             "summary": {},
         }
 
-    derived_frames: list[pd.DataFrame] = []
     group_cols = ["market", "event_rule", "horizon_days"]
-
-    for _, grp in history.groupby(group_cols, sort=False):
-        g = grp.sort_values("as_of_date").copy()
-        g["probability_delta_1obs"] = g["event_probability"].diff(1)
-        g["probability_delta_5obs"] = g["event_probability"].diff(5)
-        g["probability_mean_5obs"] = g["event_probability"].rolling(5, min_periods=2).mean()
-        g["probability_std_5obs"] = g["event_probability"].rolling(5, min_periods=2).std()
-        g["probability_min_20obs"] = g["event_probability"].rolling(20, min_periods=2).min()
-        g["probability_max_20obs"] = g["event_probability"].rolling(20, min_periods=2).max()
-        g["historical_percentile"] = _percentile_rank(g["event_probability"])
-        g["signal_zscore"] = (
-            (g["event_probability"] - g["probability_mean_5obs"]) / g["probability_std_5obs"]
-        )
-        g["signal_trend"] = [
-            _classify_trend(short, medium)
-            for short, medium in zip(
-                g["probability_delta_1obs"],
-                g["probability_delta_5obs"],
-            )
-        ]
-        derived_frames.append(g)
-
-    signal_history = pd.concat(derived_frames, ignore_index=True)
     latest_signals = (
-        signal_history.sort_values("as_of_date")
+        history.sort_values("as_of_date")
         .groupby(group_cols, as_index=False)
         .tail(1)
         .reset_index(drop=True)
@@ -356,6 +371,75 @@ def build_dashboard_state(
             }
         )
 
+    latest_signals = latest_signals.merge(
+        eval_subset,
+        on=["event_rule", "horizon_days"],
+        how="left",
+    )
+    latest_signals = latest_signals.merge(
+        backtest_subset,
+        on=["market", "horizon_days"],
+        how="left",
+    )
+    latest_signals = latest_signals.merge(
+        xgb_subset,
+        on=["event_rule", "horizon_days"],
+        how="left",
+    )
+
+    dense_frames: list[pd.DataFrame] = []
+    for row in latest_signals.itertuples(index=False):
+        dense = _load_scored_history_from_artifact(
+            artifact_dir=getattr(row, "eval_artifact_dir", None),
+            market=getattr(row, "market"),
+            event_rule=getattr(row, "event_rule"),
+            horizon_days=int(getattr(row, "horizon_days")),
+        )
+        if not dense.empty:
+            dense_frames.append(dense)
+
+    sparse_history = history.copy()
+    sparse_history["history_source"] = "friendly_summary"
+    combined_history = pd.concat([sparse_history, *dense_frames], ignore_index=True, sort=False)
+    combined_history["source_rank"] = combined_history["history_source"].map(
+        {"artifact_test_scored": 0, "friendly_summary": 1}
+    ).fillna(0)
+    combined_history = (
+        combined_history.sort_values(["market", "event_rule", "horizon_days", "as_of_date", "source_rank"])
+        .drop_duplicates(subset=["market", "event_rule", "horizon_days", "as_of_date"], keep="last")
+        .drop(columns=["source_rank"])
+        .reset_index(drop=True)
+    )
+
+    derived_frames: list[pd.DataFrame] = []
+    for _, grp in combined_history.groupby(group_cols, sort=False):
+        g = grp.sort_values("as_of_date").copy()
+        g["probability_delta_1obs"] = g["event_probability"].diff(1)
+        g["probability_delta_5obs"] = g["event_probability"].diff(5)
+        g["probability_mean_5obs"] = g["event_probability"].rolling(5, min_periods=2).mean()
+        g["probability_std_5obs"] = g["event_probability"].rolling(5, min_periods=2).std()
+        g["probability_min_20obs"] = g["event_probability"].rolling(20, min_periods=2).min()
+        g["probability_max_20obs"] = g["event_probability"].rolling(20, min_periods=2).max()
+        g["historical_percentile"] = _percentile_rank(g["event_probability"])
+        g["signal_zscore"] = (
+            (g["event_probability"] - g["probability_mean_5obs"]) / g["probability_std_5obs"]
+        )
+        g["signal_trend"] = [
+            _classify_trend(short, medium)
+            for short, medium in zip(
+                g["probability_delta_1obs"],
+                g["probability_delta_5obs"],
+            )
+        ]
+        derived_frames.append(g)
+
+    signal_history = pd.concat(derived_frames, ignore_index=True)
+    latest_signals = (
+        signal_history.sort_values("as_of_date")
+        .groupby(group_cols, as_index=False)
+        .tail(1)
+        .reset_index(drop=True)
+    )
     latest_signals = latest_signals.merge(
         eval_subset,
         on=["event_rule", "horizon_days"],

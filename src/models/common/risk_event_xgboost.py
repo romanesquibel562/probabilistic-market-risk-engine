@@ -192,6 +192,16 @@ def run_step6_event_xgboost(cfg: EventLogitConfig) -> Path:
     scored["p_raw"] = p_test
     scored.to_csv(out_dir / "test_scored.csv", index=False)
 
+    y_full, _ = _make_event_labels(df, cfg=cfg, evdef=evdef)
+    X_full = df[feature_cols].apply(pd.to_numeric, errors="coerce").astype(float)
+    p_full = model.predict_proba(X_full)[:, 1]
+    full_scored = df[
+        [c for c in ["market", "as_of_date", "forward_date", "target_value"] if c in df.columns]
+    ].copy()
+    full_scored["y_event"] = y_full
+    full_scored["p_raw"] = p_full
+    full_scored.to_csv(out_dir / "full_scored.csv", index=False)
+
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(run_meta, f, indent=2)
 
